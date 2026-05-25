@@ -1,0 +1,47 @@
+# Bash agent: Variational TC (V1) — continuous Gaussian reward from pairwise sim
+# Experiment 8: ablation of exp5 (same skip_ws, GPU 0 single) with discrete pairs
+# replaced by continuous z_i advantages + KL regularizer.
+#
+# Theory: instead of binary pos/neg pair labels, model the reward as a distribution.
+# z_i = (mean_sim(τ_i, others) - μ) / σ  — normalized consensus score per rollout.
+# GRPO loss uses z_i as advantages; KL = mean(z_i²)/2 prevents reward collapse.
+
+model = "Qwen/Qwen2.5-1.5B-Instruct"
+
+exclude_task_ids = ["find_py", "find_exec", "sort_uniq"]
+
+[env]
+id = "bash_agent"
+
+[inference]
+gpus = 1
+
+[inference.args]
+enforce_eager = true
+
+[trainer]
+gpus = 1
+
+[trainer.args]
+run_name = "bash-agent-tc-exp8"
+skip_weight_sync = true
+report_to = "none"
+max_concurrent = 1
+
+use_lora = true
+lora_rank = 16
+learning_rate = 1e-5
+micro_batch_size = 8
+rollouts_per_example = 8
+batch_size = 88             # 11 tasks × 8 rollouts
+max_steps = 200
+max_tokens = 512
+max_seq_len = 2048
+
+# Enable TC infrastructure (stdout extraction, sim computation) in generator
+use_terminal_contrastive = true
+terminal_sim_measure = "strict"
+
+# V1: variational TC — continuous z_i advantages replace discrete InfoNCE pairs
+use_variational_tc = true
+variational_beta = 0.01

@@ -1,0 +1,50 @@
+# Bash agent: Variational TC (V1) + weight sync — 3B scale test
+# Experiment 14: Qwen2.5-3B-Instruct with same VarTC V1 + weight sync as Exp9
+# Tests whether TC diversity signal holds at 3B (between 1.5B→works, 9B→fails).
+# Full 200 steps to match Exp9 training budget.
+#
+# Comparison:
+#   Exp9:  Qwen2.5-1.5B → diversity~0.17, vt_kl~0.45, acc=0.714 (200 steps)
+#   Exp13: Qwen3.5-9B   → diversity~0.05, vt_kl=0.00, acc=null  (stopped@5)
+#   Exp14: Qwen2.5-3B   → diversity=?, vt_kl=?, acc=?           (200 steps)
+
+model = "Qwen/Qwen2.5-3B-Instruct"
+
+exclude_task_ids = ["find_py", "find_exec", "sort_uniq"]
+
+[env]
+id = "bash_agent"
+
+[inference]
+gpus = 1
+
+[inference.args]
+enforce_eager = true
+
+[trainer]
+gpus = 1
+
+[trainer.args]
+run_name = "bash-agent-tc-exp14"
+report_to = "none"
+max_concurrent = 1
+
+use_lora = true
+lora_rank = 16
+learning_rate = 1e-5
+micro_batch_size = 2
+rollouts_per_example = 8
+batch_size = 88
+max_steps = 200
+save_steps = 200
+max_tokens = 512
+max_seq_len = 2048
+
+use_terminal_contrastive = true
+terminal_sim_measure = "strict"
+
+use_variational_tc = true
+variational_beta = 0.01
+
+vllm_server_port = 8006
+nccl_group_port = 51219

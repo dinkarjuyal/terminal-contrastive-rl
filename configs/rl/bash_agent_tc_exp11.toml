@@ -1,0 +1,43 @@
+# Bash agent: Variational TC V1 + weight sync, 400 steps (exp9 extended)
+# Experiment 11: Identical to exp9 but 2× training budget.
+# Exp9 reached 0.714 at step 200; entropy still declining → may improve further.
+
+model = "Qwen/Qwen2.5-1.5B-Instruct"
+
+exclude_task_ids = ["find_py", "find_exec", "sort_uniq"]
+
+[env]
+id = "bash_agent"
+
+[inference]
+gpus = 1
+
+[inference.args]
+enforce_eager = true
+
+[trainer]
+gpus = 1
+
+[trainer.args]
+run_name = "bash-agent-tc-exp11"
+report_to = "none"
+max_concurrent = 1
+
+use_lora = true
+lora_rank = 16
+learning_rate = 1e-5
+micro_batch_size = 8
+rollouts_per_example = 8
+batch_size = 88
+max_steps = 400
+max_tokens = 512
+max_seq_len = 2048
+
+use_terminal_contrastive = true
+terminal_sim_measure = "strict"
+
+use_variational_tc = true
+variational_beta = 0.01
+
+vllm_server_port = 8002
+nccl_group_port = 51221

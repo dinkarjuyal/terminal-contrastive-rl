@@ -1,0 +1,49 @@
+# Bash agent: Variational TC (V1) + weight sync — 9B scale
+# Experiment 13: Qwen3.5-9B with same VarTC V1 + weight sync as Exp9
+# Tests whether TC signal scales to 6× model size (1.5B → 9B).
+# Using max_steps=100 since 9B steps take ~6x longer than 1.5B.
+#
+# Comparison:
+#   Exp9:  Qwen2.5-1.5B + variational TC V1 + weight sync → 0.714 (200 steps)
+#   Exp13: Qwen3.5-9B  + variational TC V1 + weight sync → (this, 100 steps)
+
+model = "Qwen/Qwen3.5-9B"
+
+exclude_task_ids = ["find_py", "find_exec", "sort_uniq"]
+
+[env]
+id = "bash_agent"
+
+[inference]
+gpus = 1
+
+[inference.args]
+enforce_eager = true
+
+[trainer]
+gpus = 1
+
+[trainer.args]
+run_name = "bash-agent-tc-exp13"
+report_to = "none"
+max_concurrent = 1
+
+use_lora = true
+lora_rank = 16
+learning_rate = 5e-6
+micro_batch_size = 2
+rollouts_per_example = 8
+batch_size = 88
+max_steps = 100
+save_steps = 20
+max_tokens = 512
+max_seq_len = 2048
+
+use_terminal_contrastive = true
+terminal_sim_measure = "strict"
+
+use_variational_tc = true
+variational_beta = 0.01
+
+vllm_server_port = 8005
+nccl_group_port = 51218

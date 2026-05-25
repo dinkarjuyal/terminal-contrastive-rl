@@ -1,0 +1,53 @@
+# Bash agent: Vector Lambda Sampling (V2) + weight sync — extended 400-step training
+# Experiment 15: Same as Exp10 (V2+ws) but 400 steps (2× training budget)
+# Launches on GPU1+4 after Exp12 completes (same GPUs, different NCCL port).
+# Only run if V2 (exp10 eval) > V1 baseline (0.714); otherwise exp11 covers extended V1.
+#
+# Comparison:
+#   Exp9:  V1+ws 200 steps → 0.714
+#   Exp10: V2+ws 200 steps → (eval pending)
+#   Exp11: V1+ws 400 steps → (running)
+#   Exp15: V2+ws 400 steps → (this, conditional on V2>V1)
+
+model = "Qwen/Qwen2.5-1.5B-Instruct"
+
+exclude_task_ids = ["find_py", "find_exec", "sort_uniq"]
+
+[env]
+id = "bash_agent"
+
+[inference]
+gpus = 1
+
+[inference.args]
+enforce_eager = true
+
+[trainer]
+gpus = 1
+
+[trainer.args]
+run_name = "bash-agent-tc-exp15"
+report_to = "none"
+max_concurrent = 1
+
+use_lora = true
+lora_rank = 16
+learning_rate = 1e-5
+micro_batch_size = 8
+rollouts_per_example = 8
+batch_size = 88
+max_steps = 400
+save_steps = 400
+max_tokens = 512
+max_seq_len = 2048
+
+use_terminal_contrastive = true
+terminal_sim_measure = "strict"
+
+use_vector_tc = true
+reward_vector_dim = 3
+dirichlet_alpha = 1.0
+variational_beta = 0.01
+
+vllm_server_port = 8007
+nccl_group_port = 51220

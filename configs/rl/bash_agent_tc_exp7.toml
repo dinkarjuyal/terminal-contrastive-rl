@@ -1,0 +1,50 @@
+# Bash agent: terminal contrastive + Barlow Twins diversity regularization
+# Experiment 7: ablation against exp5 (same setup + barlow_diversity on top)
+# Single GPU 0, skip_weight_sync, 11 filtered tasks
+
+model = "Qwen/Qwen2.5-1.5B-Instruct"
+
+# Tasks excluded because base model acc=0 (consistent failure = TC false positives)
+exclude_task_ids = ["find_py", "find_exec", "sort_uniq"]
+
+[env]
+id = "bash_agent"
+
+[inference]
+gpus = 1
+
+[inference.args]
+enforce_eager = true
+
+[trainer]
+gpus = 1
+
+[trainer.args]
+run_name = "bash-agent-tc-exp7"
+skip_weight_sync = true   # single GPU — NCCL requires separate GPUs
+report_to = "none"
+max_concurrent = 1
+
+use_lora = true
+lora_rank = 16
+learning_rate = 1e-5
+micro_batch_size = 8
+rollouts_per_example = 8
+batch_size = 88             # 11 tasks × 8 rollouts
+max_steps = 200
+max_tokens = 512
+max_seq_len = 2048
+
+vllm_server_port = 8002
+
+use_terminal_contrastive = true
+terminal_sim_thresh_pos = 0.70
+terminal_sim_thresh_neg = 0.20
+terminal_contrastive_weight = 0.15
+terminal_contrastive_temperature = 0.1
+terminal_sim_measure = "strict"
+
+# Barlow Twins diversity regularization (Plan B from plan.txt)
+use_barlow_diversity = true
+barlow_weight = 0.01
+barlow_lambda = 0.005

@@ -1,0 +1,44 @@
+# Example configuration with contrastive loss
+# This demonstrates how to enable contrastive loss for implicit hard negative mining
+
+model = "Qwen/Qwen2.5-1.5B-Instruct"
+
+[env]
+id = "gsm8k"
+
+[inference]
+gpus = 1
+
+[inference.args]
+enforce_eager = true
+
+[trainer]
+gpus = 1
+
+[trainer.args]
+run_name = "gsm8k-contrastive"
+
+# Standard training parameters
+use_lora = true
+learning_rate = 1e-5
+micro_batch_size = 8
+rollouts_per_example = 8  # Important: Need multiple rollouts for contrastive loss
+batch_size = 128
+max_steps = 100
+max_tokens = 512
+max_seq_len = 2048
+
+# Contrastive loss parameters (NEW!)
+use_contrastive_loss = true              # Enable contrastive loss
+contrastive_weight = 0.1                 # Weight relative to GRPO (0.1 = 10%)
+contrastive_temperature = 0.1            # Temperature for scoring (lower = sharper)
+contrastive_mode = "infonce"             # Mode: "infonce" or "dpo"
+
+# Experiment with different settings:
+# - contrastive_weight: Try 0.05, 0.1, 0.2, 0.5
+# - contrastive_temperature: Try 0.05, 0.1, 0.2
+# - contrastive_mode: "infonce" (multi-negative) or "dpo" (pairwise)
+
+
+
+

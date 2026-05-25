@@ -1,0 +1,46 @@
+# Bash agent: terminal contrastive training (verifier-free)
+# Experiment 3: scaled run — 10 tasks × 8 rollouts, 200 steps, dedicated GPU 7
+
+model = "Qwen/Qwen2.5-1.5B-Instruct"
+
+[env]
+id = "bash_agent"
+
+[inference]
+gpus = 1
+
+[inference.args]
+enforce_eager = true
+
+[trainer]
+gpus = 1
+
+[trainer.args]
+run_name = "bash-agent-tc-exp3"
+skip_weight_sync = true   # use plain vllm serve (no vf-vllm needed)
+report_to = "none"        # disable W&B (no login required)
+max_concurrent = 1        # serialize vLLM requests (avoids tokenizer thread-safety issue)
+
+# Standard training
+use_lora = true
+lora_rank = 16
+learning_rate = 1e-5
+micro_batch_size = 8        # must equal rollouts_per_example for TC pairs to form
+rollouts_per_example = 8
+batch_size = 80             # 10 tasks × 8 rollouts
+max_steps = 200
+max_tokens = 512
+max_seq_len = 4096          # GPU 7 dedicated (40GB), restored from 2048
+
+# Terminal contrastive loss (verifier-free)
+use_terminal_contrastive = true
+terminal_sim_thresh_pos = 0.70   # tune up if too many false positives
+terminal_sim_thresh_neg = 0.20
+terminal_contrastive_weight = 0.15
+terminal_contrastive_temperature = 0.1
+terminal_sim_measure = "strict"  # number-strict + containment jaccard
+
+# Watch in logs:
+#   tc/positive_pair_rate  — should be > 0.3 (gate for Experiment 1)
+#   tc/diversity           — watch for collapse toward 0
+#   tc_loss/mean           — should decrease over training
