@@ -1,0 +1,60 @@
+# Bash agent: Density-Bootstrap Policy Optimization (DBPO, §4c in research plan)
+# Experiment 16: KDE log-density reward replaces V1's mean-sim reward.
+#
+# Key differences from exp9 (V1):
+#   - reward_i = log( (1/(G-1)) sum_{j != i} exp(-(1 - sim(i,j))^2 / (2 h^2)) )
+#   - threshold-free: bandwidth h replaces thresh_pos/thresh_neg
+#   - consistent estimator of log p(o | task) as G -> infinity
+#
+# Comparison targets:
+#   Base:  0.562
+#   Exp6:  discrete TC + ws            -> 0.688
+#   Exp9:  V1 (mean-sim z-score) + ws  -> 0.714
+#   Exp10: V2 (Dirichlet lambda) + ws  -> 0.723
+#   Exp16: DBPO (KDE density) + ws     -> this run
+#
+# We co-enable use_variational_tc=true so the existing trainer KL-diagnostic
+# (vt_kl_loss) is computed on the DBPO-written advantages with no extra code.
+
+model = "Qwen/Qwen2.5-1.5B-Instruct"
+
+exclude_task_ids = ["find_py", "find_exec", "sort_uniq"]
+
+[env]
+id = "bash_agent"
+
+[inference]
+gpus = 1
+
+[inference.args]
+enforce_eager = true
+
+[trainer]
+gpus = 1
+
+[trainer.args]
+run_name = "bash-agent-tc-exp16"
+report_to = "none"
+max_concurrent = 1
+
+use_lora = true
+lora_rank = 16
+learning_rate = 1e-5
+micro_batch_size = 8
+rollouts_per_example = 8
+batch_size = 88
+max_steps = 200
+save_steps = 50
+max_tokens = 512
+max_seq_len = 2048
+
+use_terminal_contrastive = true
+terminal_sim_measure = "strict"
+
+use_density_tc = true
+density_bandwidth = 0.2
+use_variational_tc = true     # enables vt_kl_loss diagnostic on DBPO advantages
+variational_beta = 0.01
+
+vllm_server_port = 8002
+nccl_group_port = 51217

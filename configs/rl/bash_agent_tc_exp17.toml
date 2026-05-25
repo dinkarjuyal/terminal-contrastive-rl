@@ -1,0 +1,57 @@
+# Bash agent: Scalar self-similarity GRPO baseline (RQ1.c in research plan)
+# Experiment 17: pure GRPO with the env reward replaced by mean pairwise sim.
+# No contrastive loss, no variational z-score, no Dirichlet vector.
+#
+# This is the "is the contrastive/variational machinery actually needed, or does
+# any self-consistency reward shaped through plain GRPO match it?" baseline.
+# If exp17 >= exp9 (0.714), the contrastive framing is decorative; the
+# contribution collapses to "self-similarity is a usable verifier-free reward".
+# If exp17 < exp9, the variational z-score normalization is doing real work.
+#
+# Comparison targets:
+#   Base:  0.562
+#   Exp9:  V1 (mean-sim z-score) + ws  -> 0.714
+#   Exp17: scalar self-sim GRPO + ws   -> this run
+
+model = "Qwen/Qwen2.5-1.5B-Instruct"
+
+exclude_task_ids = ["find_py", "find_exec", "sort_uniq"]
+
+[env]
+id = "bash_agent"
+
+[inference]
+gpus = 1
+
+[inference.args]
+enforce_eager = true
+
+[trainer]
+gpus = 1
+
+[trainer.args]
+run_name = "bash-agent-tc-exp17"
+report_to = "none"
+max_concurrent = 1
+
+use_lora = true
+lora_rank = 16
+learning_rate = 1e-5
+micro_batch_size = 8
+rollouts_per_example = 8
+batch_size = 88
+max_steps = 200
+save_steps = 50
+max_tokens = 512
+max_seq_len = 2048
+
+# Pure GRPO machinery: terminal_contrastive disabled so the pair-selection /
+# variational / vector branches do not fire. The scalar self-sim override
+# happens earlier in generate_batch (before the TC gate) and rewrites the env
+# reward in place; standard GRPO group-mean subtraction handles the rest.
+use_terminal_contrastive = false
+terminal_sim_measure = "strict"
+use_scalar_self_sim_grpo = true
+
+vllm_server_port = 8003
+nccl_group_port = 51218

@@ -13,7 +13,13 @@ from pydantic import BaseModel, Field
 from transformers import PreTrainedTokenizerBase
 
 from verifiers import Environment
-from verifiers.rl.trainer.terminal_similarity import compute_reward_vector, mean_sim_per_rollout, select_pairs, trajectory_diversity
+from verifiers.rl.trainer.terminal_similarity import (
+    compute_reward_vector,
+    density_reward_per_rollout,
+    mean_sim_per_rollout,
+    select_pairs,
+    trajectory_diversity,
+)
 
 
 class Microbatch(BaseModel):
@@ -81,6 +87,9 @@ class Generator:
         terminal_sim_measure: str = "strict",
         use_variational_tc: bool = False,
         use_vector_tc: bool = False,
+        use_density_tc: bool = False,
+        density_bandwidth: float = 0.2,
+        use_scalar_self_sim_grpo: bool = False,
     ):
         self.env = env
         self.client_base_url = client_base_url
@@ -108,6 +117,9 @@ class Generator:
         self.terminal_sim_measure = terminal_sim_measure
         self.use_variational_tc = use_variational_tc
         self.use_vector_tc = use_vector_tc
+        self.use_density_tc = use_density_tc
+        self.density_bandwidth = density_bandwidth
+        self.use_scalar_self_sim_grpo = use_scalar_self_sim_grpo
 
         # queues for communication
         self.request_queue = queue.Queue()
@@ -288,6 +300,28 @@ class Generator:
             rewards_dict[k] = env_results.metrics[k]
 
         rewards: list[float] = processed_results.rewards
+
+        # RQ1.c — scalar self-similarity GRPO baseline: overwrite the env reward
+        # with the mean pairwise similarity for the rollout's group, leaving the
+        # rest of the GRPO pipeline (group-mean subtraction below) unchanged.
+        # Uses the *strided* index space because env_results.state[strided_i] is
+        # the rollout that produced rewards[interleaved(strided_i)]; we recompute
+        # in interleaved space after reorder.
+        if getattr(self, "use_scalar_self_sim_grpo", False):
+            measure = getattr(self, "terminal_sim_measure", "strict")
+            for p in range(N):
+                strided_indices = [
+                    p + k * N for k in range(G) if (p + k * N) < len(env_results.state)
+                ]
+                first_state = env_results.state[strided_indices[0]] if strided_indices else {}
+                if "final_stdout" not in first_state:
+                    continue
+                stdouts = [env_results.state[i].get("final_stdout", "") for i in strided_indices]
+                exit_codes = [env_results.state[i].get("exit_code", 0) for i in strided_indices]
+                sim_scores = mean_sim_per_rollout(stdouts, exit_codes=exit_codes, measure=measure)
+                for k, s in enumerate(sim_scores):
+                    rewards[p * G + k] = s
+
         advantages: list[float] = [0.0] * len(rewards)
         # Advantages in interleaved space: group [p*G, (p+1)*G) is all rollouts of prompt p
         for p in range(N):
@@ -339,6 +373,21 @@ class Generator:
                     var = sum((s - mu) ** 2 for s in sim_scores) / len(sim_scores)
                     sigma = max(var ** 0.5, 0.05)
                     z_scores = [(s - mu) / sigma for s in sim_scores]
+                    for k, z in enumerate(z_scores):
+                        advantages[p * G + k] = z
+                    diversity_scores.append(sigma)
+                    total_possible_pairs += G * (G - 1) // 2
+                elif getattr(self, "use_density_tc", False):
+                    # DBPO (§4c): KDE log-density reward → z-score normalize → advantage.
+                    # Threshold-free, single-hyperparameter (bandwidth) alternative to V1.
+                    bw = getattr(self, "density_bandwidth", 0.2)
+                    log_density = density_reward_per_rollout(
+                        stdouts, exit_codes=exit_codes, measure=measure, bandwidth=bw,
+                    )
+                    mu = sum(log_density) / len(log_density)
+                    var = sum((s - mu) ** 2 for s in log_density) / len(log_density)
+                    sigma = max(var ** 0.5, 0.05)
+                    z_scores = [(s - mu) / sigma for s in log_density]
                     for k, z in enumerate(z_scores):
                         advantages[p * G + k] = z
                     diversity_scores.append(sigma)

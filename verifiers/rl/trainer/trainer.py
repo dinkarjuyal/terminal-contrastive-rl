@@ -123,6 +123,9 @@ class RLTrainer(Trainer):
                 terminal_sim_measure=args.terminal_sim_measure,
                 use_variational_tc=getattr(args, "use_variational_tc", False),
                 use_vector_tc=getattr(args, "use_vector_tc", False),
+                use_density_tc=getattr(args, "use_density_tc", False),
+                density_bandwidth=getattr(args, "density_bandwidth", 0.2),
+                use_scalar_self_sim_grpo=getattr(args, "use_scalar_self_sim_grpo", False),
             )
             self.generator.start()
             self.generator.submit_batch(0)

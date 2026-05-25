@@ -13,6 +13,7 @@ Four measures ranked by expected quality (to be validated via overfit inspection
 """
 
 import difflib
+import math
 import re
 import string
 from itertools import combinations
@@ -332,3 +333,45 @@ def mean_sim_per_rollout(
         sum(matrix[i][j] for j in range(n) if j != i) / (n - 1)
         for i in range(n)
     ]
+
+
+def density_reward_per_rollout(
+    stdouts: list[str],
+    exit_codes: list[int] | None = None,
+    measure: str = "strict",
+    bandwidth: float = 0.2,
+) -> list[float]:
+    """
+    Leave-one-out KDE log-density reward over the rollout group (threshold-free).
+
+    Treats (1 - sim(i, j)) as a 'distance' in similarity-space and applies a
+    Gaussian kernel of bandwidth h:
+
+        r_i = log( (1 / (G - 1)) * sum_{j != i} exp( -(1 - sim(i, j))^2 / (2 h^2) ) )
+
+    As G -> infinity, r_i -> log p(o_i | task) up to bandwidth-induced bias.
+    This is the §4c "Density-Bootstrap" reward in the research plan: a single
+    bandwidth hyperparameter replaces both thresh_pos and thresh_neg and yields
+    a continuous, differentiable consensus signal.
+
+    Returns a list of log-densities, one per rollout. Caller should z-score these
+    across the group (matching V1) before using as the GRPO advantage.
+    """
+    n = len(stdouts)
+    if n <= 1:
+        return [0.0] * n
+    matrix = compute_similarity_matrix(stdouts, exit_codes, measure)
+    h2 = max(bandwidth * bandwidth, 1e-8)
+    log_norm = math.log(max(n - 1, 1))
+    rewards: list[float] = []
+    for i in range(n):
+        log_terms = [
+            -((1.0 - matrix[i][j]) ** 2) / (2.0 * h2)
+            for j in range(n)
+            if j != i
+        ]
+        # numerically stable logsumexp
+        m = max(log_terms)
+        s = sum(math.exp(lt - m) for lt in log_terms)
+        rewards.append(m + math.log(s) - log_norm)
+    return rewards

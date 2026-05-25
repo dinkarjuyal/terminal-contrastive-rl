@@ -491,14 +491,43 @@ The single highest-leverage move is **§4c (KDE / score-matching reward bootstra
 
 ## 9. Handoff checklist for the next agent
 
-- [ ] Implement RQ1 baselines: scalar-self-sim GRPO, majority-vote SFT, oracle-reward GRPO. Reuse existing trainer; only the reward function changes.
-- [ ] Implement KDE reward (§4c). Embedding source: reuse the rollout encoder if one exists, else pool last-layer hidden states from the policy model.
-- [ ] Implement align+uniform aux loss (§4e) from https://github.com/ssnl/align_uniform.
-- [ ] Implement quantile-advantage (§4b) as a swap for `(R-μ)/σ` in the trainer.
-- [ ] Implement surprisal-gating (§4d) as a per-token multiplier in the PG loss.
-- [ ] Add ELBO formulation (§4a) — lower priority; gate on §4c results.
-- [ ] Sensitivity sweep over τ ∈ {0.5, 0.6, 0.7, 0.8, 0.9}.
+- [x] Implement KDE reward (§4c). Lives in `verifiers/rl/trainer/terminal_similarity.py::density_reward_per_rollout`. Threshold-free; single hyperparameter (`density_bandwidth`). Wired through generator + config as `use_density_tc`. Local smoke test confirms consensus > outlier, bandwidth monotonicity, exit-gate respected. **Repo: github.com/dinkarjuyal/terminal-contrastive-rl** (private). **Config: `configs/rl/bash_agent_tc_exp16.toml`**. Launch script: `scripts/launch_exp16.sh` (uses GPUs 3 + 4 on nodeset3, vLLM port 8002, NCCL group port 51217).
+- [x] Implement scalar self-similarity GRPO baseline (RQ1.c). Wired as `use_scalar_self_sim_grpo` in generator (reward override happens before group-mean subtraction; no contrastive/variational machinery). **Config: `configs/rl/bash_agent_tc_exp17.toml`**. Launch script: `scripts/launch_exp17.sh` (GPUs 5 + 6, vLLM port 8003, NCCL port 51218).
+- [x] Unit tests: `tests/test_terminal_similarity_density.py` (singleton handling, consensus vs outlier, all-identical edge case, exit-gate, bandwidth monotonicity, scalar baseline parity).
+- [ ] Implement remaining RQ1 baselines: (b) majority-vote SFT on consensus rollouts; (a) oracle-reward GRPO (env reward = test-set pass rate). Less urgent than (c) which is now live as exp17.
+- [ ] Implement align+uniform aux loss (§4e) from https://github.com/ssnl/align_uniform. Wire as a drop-in replacement for `vt_kl_loss` (apply on L2-normalized pooled rollout hidden states; reference impl: `lalign = ((x-y).norm(dim=1).pow(2)).mean()`, `lunif = pdist(x).pow(2).mul(-2).exp().mean().log()`).
+- [ ] Implement quantile-advantage (§4b) as a swap for `(R-μ)/σ` in the V1/DBPO normalization step. Use `np.argsort` of `R_i` mapped to `{0, 1/G, ..., 1}` minus 0.5.
+- [ ] Implement surprisal-gating (§4d) as a per-token multiplier in the PG loss: `w_t = exp(-(log π_θ(o_t) - μ_t)^2 / (2 τ^2))` where `μ_t` is the mean rollout-group log-prob on that token. Most relevant fix for V2's 400-step format collapse.
+- [ ] Add ELBO formulation (§4a) — lower priority; gate on §4c (exp16) results.
+- [ ] Sensitivity sweep over τ ∈ {0.5, 0.6, 0.7, 0.8, 0.9} for the *discrete* TC baseline, plus a bandwidth sweep `h ∈ {0.1, 0.15, 0.2, 0.3, 0.5}` for DBPO.
 - [ ] Run 3+ seeds for every reported number; report task-paired bootstrap CIs.
 - [ ] Add one non-bash domain (GSM8K or HumanEval+ recommended).
-- [ ] Diversity-controlled 9B re-run (temperature schedule, top-p relaxation).
-- [ ] Rename method; rewrite §4 of the paper to match whichever formulation lands best empirically.
+- [ ] Diversity-controlled 9B re-run (temperature schedule, top-p relaxation). The 9B failure in exp13 is *the* publication risk.
+- [ ] Use early stopping at 200 steps as default — exp11/exp15 confirmed 400 steps catastrophically overtrains (V2 → 0.0, format collapse). Consider held-out check every 25 steps after step 150.
+- [ ] Rename method; rewrite §4 of the paper to match whichever formulation lands best empirically. If exp16 (DBPO) beats exp9 (V1), commit to "Density-Bootstrap Policy Optimization" as the title.
+
+## 10. Active experiment status (May 25, 2026)
+
+| Exp | Config | Method | Steps | Status | Notes |
+|-----|--------|--------|-------|--------|-------|
+| Exp16 | `bash_agent_tc_exp16.toml` | DBPO (KDE log-density, §4c) | 200 | Code merged + launched on nodeset3 (GPU 3 vf-vllm, GPU 4 trainer) | Density bandwidth `h=0.2`. Co-enables `use_variational_tc=true` so the `vt_kl_loss` diagnostic remains. |
+| Exp17 | `bash_agent_tc_exp17.toml` | Scalar self-sim GRPO (RQ1.c) | 200 | Code merged + launched on nodeset3 (GPU 5 vf-vllm, GPU 6 trainer) | No contrastive, no variational, no Dirichlet. Critical baseline: tests whether contrastive framing is decorative. |
+
+**Launch on nodeset3** (already done at end of May 25 session):
+```bash
+ssh nodeset3
+cd /home/ubuntu/rl/verifiers
+git pull
+bash scripts/launch_exp16.sh
+bash scripts/launch_exp17.sh
+# Monitor:
+tmux attach -t bash-agent-tc-exp16
+tmux attach -t bash-agent-tc-exp17
+# Logs at /tmp/{vllm,trainer}_exp{16,17}.log
+```
+
+**Decision tree after eval**:
+- If exp17 (scalar) ≥ exp9 (V1, 0.714): the variational/contrastive machinery is decorative. Pivot the paper to "self-similarity is a sufficient verifier-free reward" and drop V1/V2 as contributions.
+- If exp16 (DBPO) > exp9 (V1): commit to DBPO as the primary method; rename the paper accordingly. Add bandwidth sensitivity sweep.
+- If exp16 ≈ exp17 ≈ exp9: the family of self-consistency rewards is equivalent at this scale; the contribution is the *framework* and the weight-sync discovery, not any particular reward function.
+- If exp16 < exp17: density bootstrap is over-engineered relative to the simpler scalar; investigate bandwidth selection (Silverman's rule).

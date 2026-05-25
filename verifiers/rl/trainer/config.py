@@ -181,6 +181,28 @@ class RLConfig(TrainingArguments):
         metadata={"help": "Dirichlet concentration parameter α for λ sampling."},
     )
 
+    # Density-Bootstrap Policy Optimization (DBPO, §4c in research plan):
+    # threshold-free KDE log-density reward computed from the similarity matrix.
+    # Replaces both thresh_pos/thresh_neg pair selection (discrete) and V1's mean-sim
+    # reward with a continuous, consistent estimator of log p(o | task).
+    use_density_tc: bool = field(
+        default=False,
+        metadata={"help": "Use KDE log-density reward (DBPO) instead of mean-sim / pair selection."},
+    )
+    density_bandwidth: float = field(
+        default=0.2,
+        metadata={"help": "Gaussian-kernel bandwidth for density reward; smaller = sharper consensus."},
+    )
+
+    # Scalar self-similarity GRPO baseline (RQ1.c in research plan): emits raw
+    # mean pairwise similarity as the GRPO reward, with no z-score or contrastive
+    # framing. Used to test whether the +15pp gain is method-specific or just
+    # "any self-consistency reward works".
+    use_scalar_self_sim_grpo: bool = field(
+        default=False,
+        metadata={"help": "Replace env reward with mean pairwise similarity (scalar GRPO baseline)."},
+    )
+
     # Barlow Twins diversity regularization
     use_barlow_diversity: bool = field(
         default=False,
