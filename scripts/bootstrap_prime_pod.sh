@@ -12,7 +12,7 @@
 #   GPU=A100_80GB MAX_HRLY=1.50 bash scripts/bootstrap_prime_pod.sh
 set -euo pipefail
 
-GPU=${GPU:-RTX4090}          # Qwen2.5-1.5B + LoRA fits comfortably in 24 GB
+GPU=${GPU:-A6000_48GB}       # Cheapest 2-GPU offering with comfortable headroom
 GPU_COUNT=${GPU_COUNT:-2}    # 2 GPUs because weight sync needs separate physical GPUs
 DISK=${DISK:-80}
 POD_NAME=${POD_NAME:-tc-rl-exp16-17}
