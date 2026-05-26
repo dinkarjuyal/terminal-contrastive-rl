@@ -531,3 +531,114 @@ tmux attach -t bash-agent-tc-exp17
 - If exp16 (DBPO) > exp9 (V1): commit to DBPO as the primary method; rename the paper accordingly. Add bandwidth sensitivity sweep.
 - If exp16 ≈ exp17 ≈ exp9: the family of self-consistency rewards is equivalent at this scale; the contribution is the *framework* and the weight-sync discovery, not any particular reward function.
 - If exp16 < exp17: density bootstrap is over-engineered relative to the simpler scalar; investigate bandwidth selection (Silverman's rule).
+
+---
+
+# Session log — May 26, 2026 (Prime Intellect launch)
+
+This block summarises the launch session so the next agent can resume cleanly.
+
+## What ended up being run
+
+| Exp | Method | Where | Status (as of 15:48 UTC) | Eval target |
+|-----|--------|-------|--------------------------|-------------|
+| exp16 | DBPO (KDE log-density, §4c) | Prime Intellect pod `cb28888c669740e3b90c2a2eab673a93` (2× RTX A6000 48 GB, IP `64.247.196.29`) | **Running** — step 0 mid-rollout, ~1.3 rollouts/s on A6000 (~150 s/step projected, ~8–10 h for 200 steps) | accuracy ≥ exp9 (0.714); bandwidth h=0.2 |
+| exp17 | Scalar self-sim GRPO (RQ1.c) | Same pod, sequentially after exp16 | **Queued** — `seq-orchestrator` tmux waits for exp16 session to exit, then `bash scripts/launch_exp17.sh` | tests whether contrastive framing is decorative |
+
+Total expected wall-clock: ~16–20 h end-to-end. Total cost: ~$17–22 at $1.08/hr.
+
+## Pod and access
+
+- **Pod ID**: `cb28888c669740e3b90c2a2eab673a93`
+- **SSH**: `ssh -i ~/.ssh/primeintellect_ed25519 ubuntu@64.247.196.29` (or `prime pods ssh tc-rl-exp16-17`)
+- **Repo path on pod**: `/home/ubuntu/terminal-contrastive-rl`
+- **Python**: `/home/ubuntu/terminal-contrastive-rl/.venv/bin/python` (uv venv, Python 3.12.13)
+- **vllm version**: 0.17.1 (must match — see "Pitfalls" below)
+- **GPU layout**: GPU 0 = vf-vllm, GPU 1 = trainer (NCCL weight sync between them)
+- **Termination**: `prime pods terminate cb28888c669740e3b90c2a2eab673a93` once both runs eval
+
+## Tmux sessions on the pod
+
+```bash
+# Inspect live progress
+tmux ls
+tmux attach -t bash-agent-tc-exp16        # exp16 vllm + trainer panes
+tmux attach -t seq-orchestrator           # waits for exp16, fires exp17
+tmux attach -t bash-agent-tc-exp17        # (appears once exp16 finishes)
+
+# Log files
+tail -f /tmp/vllm_exp16.log
+tail -f /tmp/trainer_exp16.log
+tail -f /tmp/vllm_exp17.log
+tail -f /tmp/trainer_exp17.log
+tail -f /tmp/exp17_orchestrator.log
+```
+
+## What was different from nodeset3 (and what I patched on the pod)
+
+The exp16/exp17 launch scripts in the repo are written for nodeset3's GPU
+indices and conda layout. The bootstrap rewrote them in place on the pod (these
+edits live only on the pod's filesystem; the repo's launch scripts still target
+the nodeset3 layout for backward compat):
+
+| Knob | nodeset3 default | Pod override |
+|------|------------------|--------------|
+| `CUDA_VISIBLE_DEVICES` (exp16 vllm) | 3 | 0 |
+| `CUDA_VISIBLE_DEVICES` (exp16 trainer) | 4 | 1 |
+| `CUDA_VISIBLE_DEVICES` (exp17 vllm) | 5 | 0 |
+| `CUDA_VISIBLE_DEVICES` (exp17 trainer) | 6 | 1 |
+| `WORK_DIR` | `/home/ubuntu/rl/verifiers` | `/home/ubuntu/terminal-contrastive-rl` |
+| `PYTHON` | `/home/ubuntu/miniconda3/envs/vllm/bin/python` | `/home/ubuntu/terminal-contrastive-rl/.venv/bin/python` |
+| `VF_VLLM` | `/home/ubuntu/miniconda3/envs/vllm/bin/vf-vllm` | `/home/ubuntu/terminal-contrastive-rl/.venv/bin/vf-vllm` |
+| Trainer env injection | (none) | `CUDA_HOME=/usr/local/cuda-12.1 PATH=/usr/local/cuda-12.1/bin:$PATH` |
+
+Reusable equivalent commands (already applied on the pod):
+
+```bash
+sed -i 's|CUDA_VISIBLE_DEVICES=3 |CUDA_VISIBLE_DEVICES=0 |g' scripts/launch_exp16.sh
+sed -i 's|CUDA_VISIBLE_DEVICES=4 |CUDA_VISIBLE_DEVICES=1 |g' scripts/launch_exp16.sh
+sed -i 's|CUDA_VISIBLE_DEVICES=5 |CUDA_VISIBLE_DEVICES=0 |g' scripts/launch_exp17.sh
+sed -i 's|CUDA_VISIBLE_DEVICES=6 |CUDA_VISIBLE_DEVICES=1 |g' scripts/launch_exp17.sh
+sed -i 's|/home/ubuntu/rl/verifiers|/home/ubuntu/terminal-contrastive-rl|g' scripts/launch_exp16.sh scripts/launch_exp17.sh
+sed -i 's|/home/ubuntu/miniconda3/envs/vllm/bin/python|/home/ubuntu/terminal-contrastive-rl/.venv/bin/python|g' scripts/launch_exp16.sh scripts/launch_exp17.sh
+sed -i 's|/home/ubuntu/miniconda3/envs/vllm/bin/vf-vllm|/home/ubuntu/terminal-contrastive-rl/.venv/bin/vf-vllm|g' scripts/launch_exp16.sh scripts/launch_exp17.sh
+sed -i 's|CUDA_VISIBLE_DEVICES=1 PYTORCH_ALLOC_CONF|CUDA_HOME=/usr/local/cuda-12.1 PATH=/usr/local/cuda-12.1/bin:$PATH CUDA_VISIBLE_DEVICES=1 PYTORCH_ALLOC_CONF|' scripts/launch_exp16.sh scripts/launch_exp17.sh
+```
+
+## Pitfalls hit on this pod (worth knowing for the next provision)
+
+1. **vllm version mismatch** — uv sync resolved `vllm==0.11.0` by default; the repo's `verifiers/rl/inference/server.py` calls `init_app_state(engine, app.state, args)` (3-arg signature) which only exists in vllm ≥ 0.17. Symptom: `TypeError: init_app_state() missing 1 required positional argument: 'args'`. Fix: `uv pip install vllm==0.17.1` (the version on nodeset3).
+2. **flash-attn ABI mismatch** — after upgrading torch to 2.10 (pulled in by vllm 0.17.1), the pre-built `flash_attn_2_cuda.so` errors with `undefined symbol: _ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_ib`. Fix: `uv pip uninstall flash-attn`. vllm 0.17.1 falls back to its native attention backend without performance loss for the 1.5B/2048 workload.
+3. **`~/.config/vllm` permission denied** — the home-dir `.config` was owned in a weird state from the prebuilt image. Fix: `sudo chown -R ubuntu:ubuntu /home/ubuntu/.config && mkdir -p /home/ubuntu/.config/vllm`.
+4. **`CUDA_HOME` unset for deepspeed** — the `ubuntu_22_cuda_12` image ships CUDA runtime libs but not `nvcc` in PATH; deepspeed imports its `ops/__init__.py` which calls `is_compatible()` which calls `installed_cuda_version()` which raises `MissingCUDAException`. Fix (only nvcc, not the full toolkit): `sudo apt-get install -y cuda-nvcc-12-1`; then export `CUDA_HOME=/usr/local/cuda-12.1` and prepend `/usr/local/cuda-12.1/bin` to PATH in the trainer launch command.
+5. **GPU sizing** — H100 was overkill. The model footprint is ~20 GB peak on the trainer card + ~8 GB on vllm. **2× A6000 48 GB at $1.08/hr is the right pick** on Prime Intellect's current inventory (A10 24 GB and A100 40/80 GB were out of stock at provisioning time).
+
+## Resume / continuation guide
+
+If this session is interrupted before exp17 finishes:
+
+1. Check pod is still up: `prime pods status cb28888c669740e3b90c2a2eab673a93`.
+2. SSH in, `tmux ls` to see what's still running. If exp16 finished but the orchestrator didn't fire, manually: `bash /home/ubuntu/terminal-contrastive-rl/scripts/launch_exp17.sh`.
+3. After both exps converge (200 steps each), eval by running the existing eval script on the saved checkpoints in `outputs/bash-agent-tc-exp16/` and `outputs/bash-agent-tc-exp17/`.
+4. Compare to exp9 (0.714) and exp10 (0.723) baselines using the decision tree above.
+5. **Don't forget**: `prime pods terminate cb28888c669740e3b90c2a2eab673a93` once eval is done, otherwise the pod keeps billing at $1.08/hr.
+
+## Files added/modified this session
+
+Committed and pushed to `main` (commits `8e65390`, `30e5b6f`, `7faffe8`, `57a74db`, `fd9e2a5`):
+
+- `verifiers/rl/trainer/terminal_similarity.py` — `density_reward_per_rollout()`
+- `verifiers/rl/trainer/generator.py` — DBPO + scalar self-sim branches
+- `verifiers/rl/trainer/config.py` — `use_density_tc`, `density_bandwidth`, `use_scalar_self_sim_grpo`
+- `verifiers/rl/trainer/trainer.py` — wire new flags from RLConfig to Generator
+- `configs/rl/bash_agent_tc_exp16.toml` — DBPO config (`max_steps=200`, `density_bandwidth=0.2`)
+- `configs/rl/bash_agent_tc_exp17.toml` — scalar self-sim baseline config
+- `scripts/launch_exp16.sh`, `scripts/launch_exp17.sh` — tmux-based launchers
+- `scripts/auto_launch_exp16_17.sh` — nodeset3 polling auto-launcher (failed: util threshold caught a transient drop but free memory never recovered; replaced by Prime pod path)
+- `scripts/bootstrap_prime_pod.sh` — one-shot Prime Intellect provisioning (default: 2× A6000 48 GB)
+- `tests/test_terminal_similarity_density.py` — 6 unit tests for the density reward
+
+Local-only edits on the pod (not in the repo): the launch scripts on
+`/home/ubuntu/terminal-contrastive-rl/` have GPU/path/CUDA_HOME patches applied
+in-place via `sed`. Re-running `bootstrap_prime_pod.sh` against a fresh pod
+would reproduce them.
