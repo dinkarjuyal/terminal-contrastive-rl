@@ -12,9 +12,9 @@
 #   GPU=A100_80GB MAX_HRLY=1.50 bash scripts/bootstrap_prime_pod.sh
 set -euo pipefail
 
-GPU=${GPU:-H100_80GB}
+GPU=${GPU:-RTX4090}          # Qwen2.5-1.5B + LoRA fits comfortably in 24 GB
 GPU_COUNT=${GPU_COUNT:-2}    # 2 GPUs because weight sync needs separate physical GPUs
-DISK=${DISK:-100}
+DISK=${DISK:-80}
 POD_NAME=${POD_NAME:-tc-rl-exp16-17}
 REPO_URL=${REPO_URL:-git@github.com:dinkarjuyal/terminal-contrastive-rl.git}
 
