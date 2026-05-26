@@ -1,0 +1,54 @@
+# Smoke test (max_steps=2) for exp18: DBPO with optimized vllm flags.
+# Used to confirm the +KV cache / -enforce_eager changes do not break the
+# pipeline before paying for a 200-step run.
+#
+# Diff vs exp16:
+#   - max_steps: 200 -> 2 (smoke)
+#   - vllm --gpu-memory-utilization: 0.4 -> 0.7  (set in launch_exp18_smoke.sh)
+#   - vllm --enforce-eager: ON -> OFF             (set in launch_exp18_smoke.sh)
+#
+# Expected: 2 steps complete in ~3-4 minutes total. Compare wall_clock/generate_s
+# and tokens/completion to exp16 step-1 (138s, ~160 tokens) to estimate speedup.
+
+model = "Qwen/Qwen2.5-1.5B-Instruct"
+
+exclude_task_ids = ["find_py", "find_exec", "sort_uniq"]
+
+[env]
+id = "bash_agent"
+
+[inference]
+gpus = 1
+
+[inference.args]
+enforce_eager = false        # try CUDA graphs
+
+[trainer]
+gpus = 1
+
+[trainer.args]
+run_name = "bash-agent-tc-exp18-smoke"
+report_to = "none"
+max_concurrent = 1
+
+use_lora = true
+lora_rank = 16
+learning_rate = 1e-5
+micro_batch_size = 8
+rollouts_per_example = 8
+batch_size = 88
+max_steps = 2
+save_steps = 1
+max_tokens = 512
+max_seq_len = 2048
+
+use_terminal_contrastive = true
+terminal_sim_measure = "strict"
+
+use_density_tc = true
+density_bandwidth = 0.2
+use_variational_tc = true
+variational_beta = 0.01
+
+vllm_server_port = 8004
+nccl_group_port = 51219
