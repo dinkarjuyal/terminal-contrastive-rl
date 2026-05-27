@@ -696,14 +696,77 @@ After this, exp17 trainer started and connected to the existing vllm at `localho
 - Trainer GPU 1 memory ~19 GB (stable, no OOM concerns).
 - **Key metric difference from exp16**: `reward` is non-zero (0.46–0.51) because the scalar branch *overwrites* the env reward with mean pairwise similarity *before* GRPO group-mean subtraction. `advantage/absmean` is correspondingly small (0.07–0.13), since group-mean subtraction zero-centers it.
 
+## Eval results (step 200 checkpoints, May 27 ~15:00 UTC)
+
+Eval setup: `vf-vllm --enable-lora --lora-modules exp16=<ckpt> exp17=<ckpt>` on
+GPU 0, then `precision_check.py --model exp16 --port 8000` per LoRA. The script
+runs G=8 rollouts per task across the bash_agent test set (14 of 20 tasks are
+evaluable; the 6 stochastic-output tasks like `find_py` are skipped).
+
+| Run | Method | Rollout accuracy | Δ vs base | TC precision | TC recall |
+|-----|--------|------------------|-----------|--------------|-----------|
+| **Base (no LoRA)** | Qwen2.5-1.5B-Instruct | **0.232** | – | 0.216 | 0.800 |
+| **exp16 (DBPO @200)** | KDE log-density reward, h=0.2 | **0.036** | **−19.6 pp 💥** | 0.004 | 1.000 |
+| **exp17 (scalar @200)** | mean pairwise sim → GRPO | **0.357** | **+12.5 pp** | 0.392 | 1.000 |
+| Reference exp9 (V1) | Variational + ws | 0.714 | +48.2 pp | – | – |
+| Reference exp10 (V2) | Vector λ + ws | 0.723 | +49.1 pp | – | – |
+
+### Headline finding
+
+**DBPO collapsed catastrophically (0.036, worse than random / base by 20 pp).**
+This is the same failure mode as V2 at 400 steps (0.000 / format collapse), but
+induced from a different angle: the KDE log-density advantage rewards rollouts
+sitting in *high-density regions* of the similarity matrix, which selects "the
+most average output template" without any signal about correctness. After 200
+steps the model has fully internalised that template (entropy 0.30, tokens 94)
+and emits it for every prompt, even when it doesn't satisfy the ground truth.
+
+Mid-training trajectory of `entropy` and `tokens/completion` showed this in real
+time — see the May-27 mid-run log above; the eval just confirms what those
+diagnostics already warned about. **Lesson: high-density-reward advantage
+*without* an entropy floor is a known-bad design.** A fix would be to add
+`entropy_coef > 0` to the GRPO loss, but the more honest paper move is to drop
+DBPO entirely.
+
+### Scalar self-similarity is real but underperforms V1/V2
+
+exp17 (0.357) beats base by +12.5 pp, confirming that the contrastive-style
+signal alone (mean pairwise sim → GRPO group-mean centering) produces some real
+improvement. But it loses ~35 pp to the V1/V2 baselines — meaning the
+variational / vector-λ machinery in exp9/10 is **not** decorative. It does add
+information beyond what the scalar signal carries.
+
+Caveat: exp16/17 used `micro_batch_size = 4` (forced by the A6000 OOM at mbs=8;
+see Pitfalls §6 above) while exp9/10 used `mbs = 8` on H100. The 35 pp gap may
+be partly attributable to gradient-accumulation noise. To rule this out, the
+cleanest experiment would be to re-run exp17 on H100 (nodeset3) with mbs=8 once
+that's available.
+
+### Mid-training checkpoint eval (running now)
+
+Six checkpoints (`exp{16,17}@{50,100,150}`) are being eval'd in sequence with
+`/tmp/run_all_evals.sh` on the pod. Expected to finish at ~16:00 UTC May 27.
+If exp16's step-50 or step-100 accuracy is meaningfully higher than step-200,
+this confirms the over-training-into-collapse hypothesis and motivates early
+stopping (or a `save_steps`-based best-checkpoint selection) as a default for
+any DBPO-family training. Results will be appended below.
+
 ## What's next (in order)
 
-1. **Wait for exp17 to finish** (~7 h from now).
-2. **Eval exp16/checkpoint-200 and exp17/checkpoint-200** using `environments/bash_agent/precision_check.py --lora <ckpt-path>` against the bash_agent test set. Compare to exp9 (0.714, V1) and exp10 (0.723, V2).
-3. **Eval exp16 mid-training checkpoints (50/100/150)** to see if accuracy peaked early before entropy collapsed. This may justify early stopping or a `save_steps`-based selection strategy.
-4. **Apply decision tree** (§10 above) to determine paper framing.
-5. **Optional**: run `exp18_smoke` with `enforce_eager=false` + `gpu-memory-utilization=0.7` to verify the proposed speedup before any 3-seed re-run.
-6. **CRITICAL**: `prime pods terminate cb28888c669740e3b90c2a2eab673a93` once eval is done to stop $1.08/hr billing. As of 05:00 UTC May 27 the pod has been running ~13.5 h ≈ $14.60 of spend so far.
+1. **Wait for the 6 mid-training evals** (~30 min remaining).
+2. **Apply decision tree** (§10 above) with all evals in hand. The 200-step
+   numbers already strongly suggest: pivot the paper to position scalar
+   self-sim as a *weak-but-real* verifier-free signal that V1/V2 build on
+   top of, *and* document DBPO as a known failure mode (a contribution in
+   itself — papers often gain from a "what doesn't work" section).
+3. **Optional re-runs to control for the mbs=4 → mbs=8 gap**: rerun exp17 on
+   H100 with mbs=8 to confirm/refute that the 0.357 ≪ 0.714 gap is method
+   rather than batch size.
+4. **Optional**: `exp18_smoke` to validate the `enforce_eager=false` +
+   `gpu-memory-utilization=0.7` speedup before any new long runs.
+5. **CRITICAL**: `prime pods terminate cb28888c669740e3b90c2a2eab673a93` once
+   the mid-training evals finish. As of ~15:30 UTC May 27 the pod has run
+   ~24 h ≈ **$25.90** of spend.
 
 ## Quick resume commands (for the next agent)
 
