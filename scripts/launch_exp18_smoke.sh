@@ -23,7 +23,7 @@ VLLM_CMD="CUDA_VISIBLE_DEVICES=3 PYTHONPATH=$WORK_DIR:$WORK_DIR/environments \
   2>&1 | tee /tmp/vllm_exp18_smoke.log"
 tmux send-keys -t "$SESSION:0.0" "$VLLM_CMD" C-m
 
-tmux split-window -v -c "$WORK_DIR"
+tmux split-window -v -t "$SESSION:0" -c "$WORK_DIR"
 TRAIN_CMD="until curl -sf http://localhost:8004/health > /dev/null 2>&1; do echo 'waiting for vllm...'; sleep 5; done
 echo 'vf-vllm ready on port 8004'
 CUDA_VISIBLE_DEVICES=4 PYTORCH_ALLOC_CONF=expandable_segments:True \

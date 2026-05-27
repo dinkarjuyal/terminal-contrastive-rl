@@ -643,3 +643,87 @@ Local-only edits on the pod (not in the repo): the launch scripts on
 `/home/ubuntu/terminal-contrastive-rl/` have GPU/path/CUDA_HOME patches applied
 in-place via `sed`. Re-running `bootstrap_prime_pod.sh` against a fresh pod
 would reproduce them.
+
+---
+
+# Session log — May 27, 2026 (mid-run update: exp16 done, exp17 running)
+
+## exp16 (DBPO) — DONE
+
+- **200/200 steps in 6h 48min** (24,481 s, ~122 s/step after the mbs=8 → 4 restart).
+- Checkpoints saved: `outputs/bash-agent-tc-exp16/checkpoint-{50,100,150,200}/`
+- Final train metrics: `train_loss = -0.011`, no NaNs, no diverges.
+
+### Mid-run metric trajectory (concerning signals — borderline mode collapse)
+
+| Metric | Step 1–5 (warm-up) | Step 100 | Step 200 (final) | Interpretation |
+|--------|--------------------|----------|------------------|----------------|
+| `entropy` | 0.66 → 0.55 → 0.66 | ~0.39 | **0.30** | **Collapsed ~2× from start.** V1/exp9 typically lands at 0.40–0.50. Below 0.35 is unusual. |
+| `tokens/completion` | 181 → 155 → 171 → 166 → 190 | ~95 | **94** | **Halved.** Model is generating much shorter responses. |
+| `advantage/absmean` | 0.51 → 0.73 → 0.85 | ~0.40 | ~0.84 | Active learning signal throughout — DBPO did not collapse to zero. |
+| `tc/diversity` | 0.13 → 0.18 → 0.19 | ~0.17 | ~0.22 | Within healthy V1 range (0.14–0.18), slightly above. |
+| `vt_kl_loss` | 0.27 → 0.41 → 0.45 | ~0.40 | ~0.50 | In V1's healthy range. |
+| `tc/positive_pair_rate` | 0.0 throughout | 0.0 | 0.0 | Correct for DBPO (no pair selection). |
+
+**Hypothesis to test on eval**: DBPO's KDE-density reward may have pushed the model towards a single "answer template" that maximizes inter-rollout similarity. If eval accuracy on the bash test set ≥ exp9's 0.714, the entropy/token-length collapse is benign (concise correct answers). If eval drops below 0.6, we have a V2-style format-collapse situation and DBPO needs entropy regularization (`entropy_coef`).
+
+### Why exp17 did not auto-launch when exp16's trainer exited
+
+The trainer process exited cleanly at step 200, but the surrounding tmux pane just returned to a shell prompt instead of exiting — which kept the `bash-agent-tc-exp16` tmux session alive — which kept the orchestrator polling. **Manual intervention required**: I `kill`-ed the empty session, and the orchestrator then fired `launch_exp17.sh` 60 s later as designed.
+
+Even worse, when `launch_exp17.sh` was invoked from inside the orchestrator's tmux session, its `tmux split-window -v -c "$WORK_DIR"` command (which had no explicit `-t` target) acted on the *current* tmux client (= the orchestrator), not on the freshly-created `bash-agent-tc-exp17` session. Result: vllm came up correctly in pane 0, but **no trainer pane was ever created in the exp17 session**. The trainer command never ran.
+
+**Two fixes committed** (commit `XXX` after this push):
+
+1. `scripts/launch_exp{16,17,18_smoke}.sh`: changed `tmux split-window -v -c` to `tmux split-window -v -t "$SESSION:0" -c` so the split always targets the experiment's own session regardless of where the script is invoked from.
+2. (Pod-side only, applied via `sed`) — same patch on the live pod scripts.
+
+Manual recovery applied on the pod for the in-flight exp17:
+
+```bash
+# Add the missing trainer pane to the existing session:
+tmux split-window -v -t bash-agent-tc-exp17:0 -c /home/ubuntu/terminal-contrastive-rl
+# Send the trainer command (with CUDA_HOME, mbs=4 config, port 8003):
+tmux send-keys -t bash-agent-tc-exp17:0.1 '<trainer command>' Enter
+```
+
+After this, exp17 trainer started and connected to the existing vllm at `localhost:8003`.
+
+## exp17 (scalar self-similarity GRPO) — RUNNING
+
+- **Status as of 04:55 UTC May 27**: step 2/200, ~125 s/step (slightly faster than exp16 because no DBPO KDE compute).
+- **Projected ETA**: ~7.0 hours → ~11:45 UTC May 27.
+- Trainer GPU 1 memory ~19 GB (stable, no OOM concerns).
+- **Key metric difference from exp16**: `reward` is non-zero (0.46–0.51) because the scalar branch *overwrites* the env reward with mean pairwise similarity *before* GRPO group-mean subtraction. `advantage/absmean` is correspondingly small (0.07–0.13), since group-mean subtraction zero-centers it.
+
+## What's next (in order)
+
+1. **Wait for exp17 to finish** (~7 h from now).
+2. **Eval exp16/checkpoint-200 and exp17/checkpoint-200** using `environments/bash_agent/precision_check.py --lora <ckpt-path>` against the bash_agent test set. Compare to exp9 (0.714, V1) and exp10 (0.723, V2).
+3. **Eval exp16 mid-training checkpoints (50/100/150)** to see if accuracy peaked early before entropy collapsed. This may justify early stopping or a `save_steps`-based selection strategy.
+4. **Apply decision tree** (§10 above) to determine paper framing.
+5. **Optional**: run `exp18_smoke` with `enforce_eager=false` + `gpu-memory-utilization=0.7` to verify the proposed speedup before any 3-seed re-run.
+6. **CRITICAL**: `prime pods terminate cb28888c669740e3b90c2a2eab673a93` once eval is done to stop $1.08/hr billing. As of 05:00 UTC May 27 the pod has been running ~13.5 h ≈ $14.60 of spend so far.
+
+## Quick resume commands (for the next agent)
+
+```bash
+# Check exp17 progress:
+ssh -i ~/.ssh/primeintellect_ed25519 ubuntu@64.247.196.29 \
+  'grep -oE "[0-9]+/200" /tmp/trainer_exp17.log | sort -un | tail -3'
+
+# After exp17 finishes — kill its leftover vllm and eval exp16:
+ssh -i ~/.ssh/primeintellect_ed25519 ubuntu@64.247.196.29
+pkill -9 -f vf-vllm
+cd /home/ubuntu/terminal-contrastive-rl
+# Start vllm WITHOUT LoRA (base model):
+CUDA_VISIBLE_DEVICES=0 .venv/bin/vf-vllm \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --enforce-eager --port 8000 --gpu-memory-utilization 0.4 \
+  --enable-auto-tool-choice --tool-call-parser hermes \
+  --enable-lora --max-loras 1 --max-lora-rank 16 \
+  --lora-modules exp16=/home/ubuntu/terminal-contrastive-rl/outputs/bash-agent-tc-exp16/checkpoint-200 &
+# Once /health is 200, run precision_check.py with port 8000.
+# (The script currently hardcodes the base URL — may need a quick edit to
+#  point at the lora-loaded model. See precision_check.py top-of-file usage block.)
+```
