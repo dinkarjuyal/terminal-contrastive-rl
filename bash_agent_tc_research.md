@@ -742,14 +742,31 @@ be partly attributable to gradient-accumulation noise. To rule this out, the
 cleanest experiment would be to re-run exp17 on H100 (nodeset3) with mbs=8 once
 that's available.
 
-### Mid-training checkpoint eval (running now)
+### Mid-training checkpoint eval (full results)
 
-Six checkpoints (`exp{16,17}@{50,100,150}`) are being eval'd in sequence with
-`/tmp/run_all_evals.sh` on the pod. Expected to finish at ~16:00 UTC May 27.
-If exp16's step-50 or step-100 accuracy is meaningfully higher than step-200,
-this confirms the over-training-into-collapse hypothesis and motivates early
-stopping (or a `save_steps`-based best-checkpoint selection) as a default for
-any DBPO-family training. Results will be appended below.
+| Step | exp16 (DBPO) | exp17 (scalar self-sim GRPO) |
+|------|--------------|------------------------------|
+| 0 (base) | 0.232 | 0.232 |
+| 50  | 0.241 | 0.268 |
+| 100 | 0.223 | 0.312 |
+| 150 | **0.054** | **0.366** ← exp17 best |
+| 200 | 0.036 | 0.357 |
+
+**DBPO**: never improved over base, then a sharp phase transition between
+step 100 and step 150 collapsed it. The collapse was not visible in the
+training-time metrics until tokens/completion and entropy started dropping
+around the same window (see mid-run log earlier). DBPO is dead.
+
+**Scalar self-sim**: clean monotone improvement up to step 150, slight regress
+at step 200 (likely the early signs of the same over-optimisation pathology
+that fully consumed DBPO, just much weaker because the scalar signal is
+group-mean-centred and bounded). **Best checkpoint = step 150 (0.366).**
+
+**Implication for early stopping**: with verifier-free rewards, eval-during-
+training is mandatory. The training loss/entropy/diversity signals do NOT
+warn that the policy is drifting away from correctness, because the reward
+function itself doesn't know what correctness is. A separate held-out eval
+loop with a real ground-truth check is the only reliable stopping criterion.
 
 ## What's next (in order)
 
