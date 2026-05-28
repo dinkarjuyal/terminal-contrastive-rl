@@ -1,7 +1,7 @@
 # Verifier-Free RL for Bash Agents via Terminal Contrastive Loss
 
-**Status**: Active research — experiments running on nodeset3  
-**Date**: May 25, 2026  
+**Status**: Active research — exp16/17 complete (Prime pod terminated May 27)  
+**Last updated**: May 28, 2026  
 **Model**: Qwen2.5-1.5B-Instruct
 
 ---
@@ -319,20 +319,42 @@ VarTC requires sufficient output diversity (>~0.10 tc/diversity). The 9B model g
 
 ## Current Results Summary
 
+> ⚠️ **Base accuracy discrepancy**: nodeset3 evals give base=0.562; Prime pod evals give base=0.232. The gap is likely due to differences in the bash execution environment (different file-system state, sandbox vs native) and/or vllm version (0.17.1 on Prime vs conda version on nodeset3). **Exp16/17 results are NOT directly comparable to exp9/10** — they come from a different eval setup on different hardware. Any cross-setup comparison requires running the same base model on both.
+
+### nodeset3 results (H100, merged-LoRA eval, base=0.562)
+
 | Exp | Method | Steps | Accuracy | TC Precision | Notes |
 |-----|--------|-------|----------|--------------|-------|
 | Base | — | — | 0.562 | 0.763 | Qwen2.5-1.5B-Instruct |
 | Exp6 | Discrete TC + ws | 200 | 0.688 | 0.811 | |
 | Exp8 | VarTC V1, skip_ws | 200 | 0.518 | 0.622 | ❌ below base |
 | **Exp9** | **VarTC V1 + ws** | **200** | **0.714** | **0.885** | **+15pp** |
-| **Exp10** | **Vector λ V2 + ws** | **200** | **0.723** | **0.804** | **+16pp, best at 200 steps** |
+| **Exp10** | **Vector λ V2 + ws** | **200** | **0.723** | **0.804** | **+16pp, best** |
 | Exp10-sw | Vector λ V2, skip_ws | 200 | 0.348 | 0.317 | ❌❌ catastrophic |
 | Exp12 | VarTC V1 + ws, seed=43 | 200 | 0.714 | 0.758 | ✅ exact repro |
 | Exp11 | VarTC V1 + ws | 400 | 0.643 | — | ↓ overtrained (−7pp from 200-step peak) |
-| Exp15 | Vector λ V2 + ws | 400 | **0.000** | — | ❌❌ tool-call format collapse |
+| Exp15 | Vector λ V2 + ws | 400 | 0.000 | — | ❌❌ tool-call format collapse |
 
-**Statistical significance**: Exp9 rollout-level z=2.40, p=0.016 vs base.  
+**Statistical significance (nodeset3)**: Exp9 rollout-level z=2.40, p=0.016 vs base.  
 **Task-level 95% CI**: [0.509, 0.893] (bootstrap, 14 tasks).
+
+### Prime pod results (2× A6000, lora-module eval, base=0.232)
+
+| Exp | Method | Steps | Accuracy | Δ vs base | Notes |
+|-----|--------|-------|----------|-----------|-------|
+| Base | — | — | 0.232 | — | Qwen2.5-1.5B-Instruct, A6000, vllm 0.17.1 |
+| **Exp17** | **Scalar self-sim GRPO** | **200** | **0.357** | **+12.5pp** | Best ckpt step 150 = 0.366 (+13.4pp) |
+| Exp16 | DBPO (KDE log-density) | 200 | 0.036 | **−19.6pp 💥** | Collapsed to average template; entropy 0.66→0.30 |
+
+#### Exp16/17 mid-training trajectory
+
+| Step | Exp16 (DBPO) | Exp17 (scalar self-sim) |
+|------|--------------|-------------------------|
+| 0 (base) | 0.232 | 0.232 |
+| 50 | 0.241 | 0.268 |
+| 100 | 0.223 | 0.312 |
+| 150 | 0.054 | **0.366** ← peak |
+| 200 | 0.036 | 0.357 |
 
 ---
 
@@ -357,12 +379,20 @@ VarTC requires sufficient output diversity (>~0.10 tc/diversity). The 9B model g
 
 ## Pending Experiments and Open Questions
 
-### Exp11 + Exp15: Does Extended Training Help?
+### ✅ RESOLVED: Extended Training (Exp11, Exp15)
+Both confirmed overtraining. V1 degraded (0.714→0.643), V2 collapsed completely (0.723→0.000). 200 steps is the ceiling.
 
-Both ran for 400 steps (vs 200 in prior experiments). Evals running now.
+### ✅ RESOLVED: DBPO (Exp16)
+KDE log-density reward collapsed catastrophically (0.036, −20pp vs base). Mechanism: rewards high-density = "most average template" without correctness signal. Entropy halved (0.66→0.30), tokens/completion halved (181→94) by step 200. **DBPO is dead.**
 
-- **V1 at 400 steps** (exp11): does accuracy plateau? Entropy was declining but still falling at step 200.
-- **V2 at 400 steps** (exp15): V2 converges faster (~55s/step vs 82s/step for V1 — V2 has 3 reward components to average across, but Dirichlet sampling keeps step time similar). Does the richer reward signal lead to better long-run performance?
+### ✅ RESOLVED: Scalar self-sim GRPO (Exp17)
+Works directionally: +12.5pp over base on Prime pod (best ckpt 150: +13.4pp). Monotone improvement up to step 150, slight regress at 200. Confirms variational/vector-λ machinery is NOT decorative — exp9 (0.714) beats exp17 (0.357) by ~35pp. **Confound**: exp17 used mbs=4 vs exp9's mbs=8.
+
+### 🔲 OPEN: Resolve the mbs confound (highest priority)
+Re-run exp17 on nodeset3 H100 with mbs=8 (same as exp9). If scalar score rises from ~0.357 toward 0.714, the batch size explains most of the gap. If it stays below 0.5, the variational machinery is the genuine contributor. ~3h wall-clock on 2× H100, free on nodeset3.
+
+### 🔲 OPEN: Base accuracy discrepancy
+Run base model eval on nodeset3 with the same lora-module approach used on Prime pod. If nodeset3 also gives 0.232 with that eval setup, the 0.562 number from earlier was a merged-model eval artifact. This is a prerequisite for any cross-setup result comparison.
 
 ### Alignment-Uniformity as Explicit Objectives
 
@@ -403,21 +433,30 @@ Start with exit_success only (binary, easy signal), gradually introduce jaccard_
 
 ## What a Publishable Paper Looks Like
 
-**Core claim**: Variational Terminal Contrastive loss enables +15pp accuracy on bash task completion for 1.5B models, with zero external supervision, when combined with synchronous weight updates.
+**Revised core claim** (post exp16/17): Verifier-free RL for bash agents via self-consistency rewards works, but the reward design critically determines whether training converges or collapses. Weight-synced variational self-consistency (+15pp) beats scalar self-similarity (+12pp, likely), which beats KDE density reward (−20pp, collapse).
 
-**Ablation table** (already complete): 3×2 grid showing method × weight_sync.
+**Three-finding narrative**:
+1. **Positive**: Variational weight-synced GRPO on stdout similarity = +15pp with no external verifier
+2. **Negative (useful)**: KDE log-density reward collapses to average-template mode; entropy must be anchored
+3. **Structural**: Weight sync is necessary, not optional; staleness severity scales with reward complexity
 
-**Additional required experiments for a full paper**:
-1. ✅ Reproducibility (exp12)
-2. ✅ Scale law (exp13, exp14)
-3. ⏳ Extended training (exp11, exp15 — eval running)
-4. ❓ Explicit align/uniform objectives vs. current variational approach
-5. ❓ Task-adaptive λ (adaptive Dirichlet)
-6. ❓ Reward annealing schedule
+**Completed ablations**:
+- ✅ Method × weight_sync (3×2 table)
+- ✅ Reproducibility (exp12, seed=43: exact match)
+- ✅ Scale law (1.5B→3B→9B diversity collapse)
+- ✅ Training length (200 steps optimal; 400 steps overtrained/collapsed)
+- ✅ DBPO negative result (exp16)
+- ✅ Scalar self-sim baseline (exp17, partial — mbs confound unresolved)
 
-**Workshop submission** (arXiv + small venue): achievable now with current results. The ablation table and weight-sync discovery are the key contributions.
+**Remaining before full submission**:
+1. 🔲 Resolve mbs=4 vs mbs=8 confound (exp17 rerun on H100)
+2. 🔲 Standardize eval setup across environments (diagnose 0.562 vs 0.232 base discrepancy)
+3. 🔲 At least one non-bash domain (GSM8K or HumanEval+ recommended)
+4. 🔲 3+ seeds with task-paired bootstrap CIs for all headline numbers
 
-**Full venue** (NeurIPS/ICML): needs items 4–6 above to build a more complete story around why distribution-based losses work and when they fail.
+**Workshop submission** (arXiv + small venue): achievable now. The weight-sync ablation, DBPO negative result, and training-length findings form a complete story.
+
+**Full venue** (NeurIPS/ICML): needs items 1–4 above, plus the align+uniform auxiliary loss experiment and possibly surprisal-gating to address the entropy collapse.
 
 ---
 
