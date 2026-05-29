@@ -1,12 +1,186 @@
 # Verifier-Free RL for Bash Agents via Terminal Contrastive Loss
 
-**Status**: Active research — exp16/17 complete (Prime pod terminated May 27)  
-**Last updated**: May 28, 2026  
+**Status**: Active research — base-accuracy diagnostic done May 29; exp17-mbs8 not yet launched (waiting for free H100 pair).  
+**Last updated**: May 29, 2026 ~14:30 UTC  
 **Model**: Qwen2.5-1.5B-Instruct
 
 ---
 
-# RESUME HANDOFF (last updated: May 28, 2026)
+# RESUME HANDOFF (last updated: May 29, 2026)
+
+If you are an agent resuming this work, read this section FIRST. The session
+logs lower in this doc have full experimental detail.
+
+## What changed since the May-28 handoff
+
+**Base-accuracy diagnostic completed** (May 29 ~02:50–14:20 UTC):
+
+A vanilla `Qwen/Qwen2.5-1.5B-Instruct` model was served on nodeset3 GPU 0 with
+`vf-vllm --enforce-eager --port 8099 --gpu-memory-utilization 0.40` (no merge,
+no LoRA), then `precision_check.py --model Qwen/Qwen2.5-1.5B-Instruct --port
+8099` was run. Result: **0.536 rollout accuracy**.
+
+Compare to the three known base-accuracy data points:
+
+| Setup | Base model accuracy | Notes |
+|-------|---------------------|-------|
+| nodeset3 (merged-model approach via `run_eval_v2.sh`) | **0.562** | conda vllm |
+| nodeset3 (vanilla `vf-vllm`, no merge, this run) | **0.536** | same env, different vllm |
+| Prime A6000 (LoRA-module setup, `--enable-lora`, vllm 0.17.1) | **0.232** | different env, different vllm |
+
+**Conclusion**: nodeset3 evals are self-consistent at ~0.55 (the 0.026 gap between
+0.562 and 0.536 is within sampling noise on 14 tasks × 8 rollouts). The **0.232
+on Prime is genuinely lower** by ~30 pp — this is environment-driven (different
+bash sandbox, different filesystem state, possibly different vllm version
+behaviour), not eval-methodology.
+
+## **Major reinterpretation of all previous results**
+
+The 35 pp gap that previous runs interpreted as "scalar self-sim (0.357) ≪ V1 (0.714)"
+is **largely an artifact of the base-rate difference, not a method gap.**
+
+When evaluated as **Δ over their own base**, all three trained methods are
+within 4 pp of each other:
+
+| Run | HW | Base | Trained | Δ over own base |
+|-----|----|------|---------|-----------------|
+| **Exp17 (scalar self-sim)** | Prime A6000 | 0.232 | **0.357** | **+12.5 pp** |
+| Exp17 best (step 150) | Prime A6000 | 0.232 | **0.366** | **+13.4 pp** |
+| **Exp9 (VarTC V1 + ws)** | nodeset3 | 0.562 | **0.714** | **+15.2 pp** |
+| **Exp10 (Vector λ V2 + ws)** | nodeset3 | 0.562 | **0.723** | **+16.1 pp** |
+| Exp16 (DBPO @200) | Prime A6000 | 0.232 | 0.036 | **−19.6 pp** (collapse) |
+
+**Working hypothesis (must verify with same-env runs)**: scalar self-sim,
+V1 variational, and V2 vector-λ all deliver ~13–16 pp of improvement over
+their respective baselines. The variational/contrastive machinery is **far
+more decorative than the previous handoff suggested**. This is a much weaker
+claim for V1/V2 than the paper outline below assumed.
+
+**To prove or refute this**: run exp17 (scalar) and exp9 (V1) in the SAME
+environment with the SAME mbs=8 and compare. The cleanest experiment is
+exp17-mbs8 on nodeset3 → compare to exp9 (0.714) — both nodeset3, both mbs=8.
+
+## Infrastructure state — IMPORTANT
+
+- **0 Prime Intellect pods.** `prime pods list` is empty. No billing.
+- **nodeset3 GPUs** — fluid state. As of last check (~14:20 UTC May 29):
+
+  | GPU | Memory | Status |
+  |-----|--------|--------|
+  | 0 | 0 MiB | **FREE** (base-diag vllm just killed) |
+  | 1 | 24.8 GB | busy (tiny_vlm) |
+  | 2 | 26.2 GB | busy (tiny_vlm) |
+  | 3–7 | 23–33 GB each | busy (tiny_vlm) |
+
+  Earlier the same day they were all at 40–75 GB and 88–95 % util. So one of
+  the unrelated jobs (likely the older tiny_vlm batch from ~14 h ago) finished
+  freeing GPU 0. Re-check with `ssh nodeset3 nvidia-smi` before launching.
+
+- **nodeset3 merged checkpoints** still in `/tmp/merged_exp{8,9,10,10-sw,11,12,15}`.
+- **exp16/17 checkpoints LOST** (Prime pod terminated). Eval numbers preserved
+  in this doc; need re-training to recover the models.
+- **Local repo**: `/Users/dinkarjuyal/Desktop/agents/terminal-contrastive-rl/`,
+  branch `main`, clean. Latest commit: `f40115a` (May 27 RESUME HANDOFF added).
+- **nodeset3 repo**: `~/rl/verifiers/`, branch `main`. Run `git pull` before edits.
+
+## Next actions — strict priority order
+
+### Priority 1 — Run exp17-mbs8 on nodeset3 (BLOCKER for paper)
+
+**Why this is the single most important experiment**: it isolates whether the
+"V1 dominates scalar" claim is real method advantage or batch-size noise, in
+the same bash environment so the base-rate confound is removed.
+
+GPU 0 is currently free. The launch needs TWO GPUs (vllm + trainer with NCCL
+weight sync). Need to wait for or claim GPU 1 (or any other) to free up. Best
+candidates to monitor: GPU 1 and GPU 2 (smaller memory footprint than 3–7,
+suggesting nearer completion).
+
+```bash
+# 0. Confirm two GPUs are free:
+ssh nodeset3 'nvidia-smi --query-gpu=index,memory.used --format=csv,noheader'
+
+# 1. Sync repo to nodeset3:
+ssh nodeset3 'cd ~/rl/verifiers && git pull'
+
+# 2. Edit configs/rl/bash_agent_tc_exp17.toml on nodeset3:
+#     - micro_batch_size: 4 -> 8
+#     - run_name = "bash-agent-tc-exp17-mbs8" (avoid output dir collision)
+
+# 3. Edit scripts/launch_exp17.sh for the actually-free GPU pair, e.g. 0 and 1:
+#     - CUDA_VISIBLE_DEVICES on vllm pane: <free-gpu-A>
+#     - CUDA_VISIBLE_DEVICES on trainer pane: <free-gpu-B>
+#     - WORK_DIR, PYTHON, VF_VLLM, port (8003), config file path
+#     - Output dir of the run
+
+# 4. Launch:
+ssh nodeset3 'bash ~/rl/verifiers/scripts/launch_exp17.sh'
+
+# 5. Monitor (~3h on H100):
+ssh nodeset3 'tail -f /tmp/trainer_exp17.log'
+
+# 6. CRITICAL CHECKPOINT: at step 4, verify NO OOM. If OOM, drop mbs to 6 or
+#    re-confirm OOM was an A6000-specific issue not present on H100 80GB.
+
+# 7. Eval the final checkpoint using nodeset3's existing recipe:
+ssh nodeset3 'bash /tmp/run_eval_v2.sh exp17-mbs8 \
+    ~/rl/verifiers/outputs/bash-agent-tc-exp17-mbs8/checkpoint-200 0 8099'
+# Then: grep "Rollout accuracy" /tmp/prec_exp17-mbs8.log
+```
+
+**Expected outcomes and what they mean:**
+
+| Eval result | Interpretation |
+|-------------|----------------|
+| **0.60–0.75** (≈ exp9/10) | mbs=4 was the entire issue. Scalar self-sim is comparable to V1/V2. Paper pivots to "self-similarity is sufficient, variational machinery decorative." |
+| **0.45–0.55** | Method gap is real but smaller than previously thought. Mixed contribution paper: both findings reported. |
+| **0.30–0.45** | Same as Prime result, mbs didn't matter. V1/V2 machinery wins. Strong paper. |
+| **< 0.30 or collapse** | Something is fundamentally different about the nodeset3 conda vllm path. Investigate. |
+
+### Priority 2 — Same-env exp9 reproducibility (if time permits)
+
+Even after exp17-mbs8, the cleanest comparison is to also re-run **exp9 (V1)**
+on the SAME nodeset3 environment with `mbs=8` (which it already used). If the
+new exp9 number lands at 0.71 ± noise, the existing 0.714 is canonical. If it
+moves significantly (env drift over weeks), all comparisons need re-baselining.
+
+### Priority 3 — Write the paper
+
+Three-finding outline (originally drafted in §"What a Publishable Paper Looks
+Like" lower in this doc) needs updates given the May-29 diagnostic:
+
+1. **Variational / weight-synced GRPO for verifier-free RL** (exp9 + exp10):
+   primary positive result, +15–16 pp over base.
+2. **Scalar self-similarity is a surprisingly strong baseline** (exp17): a
+   single number per pair achieves comparable Δ over base (~+13 pp). The
+   variational/contrastive machinery's incremental contribution is small.
+   *(This finding is NEW from the May-29 diagnostic — must be re-verified
+   with exp17-mbs8 on nodeset3.)*
+3. **DBPO (KDE log-density) is a documented failure mode** (exp16):
+   high-density-region rewards collapse the policy to "most average template"
+   without correctness signal. Steps 100→150 phase-transitioned from
+   near-baseline (0.223) to broken (0.054). Use as a cautionary "what
+   doesn't work" section.
+
+## Pitfalls to remember on resume
+
+1. **vllm version** — repo's `server.py` calls `init_app_state(engine, app.state, args)` (3-arg). vllm ≥ 0.17.1 expects 3 args, vllm 0.11 expects 4. The conda env on nodeset3 has 0.17.1 — should work.
+2. **flash-attn ABI** — when upgrading torch/vllm, `flash-attn` becomes incompatible. `uv pip uninstall flash-attn` if it crashes (vllm's native attention works fine for 1.5B / 2048 seq).
+3. **`~/.config/vllm` perms** — sometimes needs `sudo chown -R ubuntu:ubuntu /home/ubuntu/.config`.
+4. **`CUDA_HOME` for deepspeed** — on a Prime pod, `sudo apt-get install -y cuda-nvcc-12-1` then `export CUDA_HOME=/usr/local/cuda-12.1 && export PATH=/usr/local/cuda-12.1/bin:$PATH` in the trainer launch.
+5. **OOM at step 4 on A6000 48 GB with `mbs=8`** — drop to `mbs=4`. Not expected on H100 80 GB but verify at step 4 anyway. **Smoke test first** (`max_steps=2` config `exp18_smoke.toml` already exists).
+6. **tmux `split-window` bug** — without an explicit `-t "$SESSION:0"` target the split applies to the calling client's tmux, not the intended new session. Already fixed in `launch_exp{16,17,18_smoke}.sh` on local repo (commit `1f90dac`); nodeset3 repo may need `git pull` to pick this up.
+7. **Eval output is large** — `precision_check.py` prints every rollout's stdout. Pipe to a file (`> /tmp/prec_<exp>.log 2>&1`) instead of streaming over SSH or commands will time out.
+8. **Pod termination is critical** — `prime pods terminate <id>` immediately after eval. $1.08/hr = ~$26/day if forgotten. Always `git push` before terminating since pod filesystem is ephemeral.
+
+## DO NOT FORGET
+
+- Verify `prime pods list` returns 0 pods before ending a session.
+- Always `git commit && git push` before terminating any pod or shutting down.
+- The repo origin is `git@github-tc-rl:dinkarjuyal/terminal-contrastive-rl.git` on nodeset3 (uses SSH deploy key `~/.ssh/tc_rl_deploy`); on local it's HTTPS.
+- `exp18_smoke.toml` exists for `max_steps=2` validation before any long run on a new GPU/environment.
+
+---
 
 If you are an agent resuming this work, read this section first. The session
 logs lower in this doc have full experimental detail.
