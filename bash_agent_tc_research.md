@@ -6,169 +6,143 @@
 
 ---
 
-# RESUME HANDOFF (last updated: May 27, 2026 ~15:55 UTC)
+# RESUME HANDOFF (last updated: May 28, 2026)
 
-If you are an agent resuming this work, read this section first, then the
-"Session log — May 27" section at the bottom for the most recent context.
+If you are an agent resuming this work, read this section first. The session
+logs lower in this doc have full experimental detail.
 
-## Infrastructure state — IMPORTANT
-- **No Prime Intellect pods are running.** `prime pods list` returns 0 pods.
-  Pod `cb28888c669740e3b90c2a2eab673a93` (2× A6000) was terminated at
-  ~15:55 UTC May 27. Total spend: ~$28. Do NOT assume any pod IP is reachable.
-- **nodeset3** is the canonical H100 8× cluster. Last known state: a MoE job
-  was pinning all 8 GPUs (per the auto_launch poller note). Re-check with
-  `ssh nodeset3 nvidia-smi` before launching anything.
+## Infrastructure state
+
+- **No Prime Intellect pods running.** Pod `cb28888c669740e3b90c2a2eab673a93`
+  terminated ~15:55 UTC May 27. `prime` CLI is not in PATH on nodeset3 — SSH
+  to local Mac and run `prime` there, or install it fresh on a new pod.
+- **nodeset3** (H100 8×): GPUs 1–7 are occupied by two unrelated jobs —
+  PID 919724 (`tiny_vlm_lab.experiments.real_connector_training`) on GPUs 1–2,
+  and PIDs 966838/841/844/847/850 on GPUs 3–7. **GPU 0 is free (0 MiB used).**
+  Re-verify with `ssh nodeset3 nvidia-smi` before launching — these jobs can
+  finish or more can start.
+- **Merged LoRA checkpoints on nodeset3 `/tmp/`** (survive across sessions
+  until pod reboots): `merged_exp8`, `merged_exp9`, `merged_exp10`,
+  `merged_exp10-sw`, `merged_exp11`, `merged_exp12`, `merged_exp15`. These
+  are ready-to-serve — skip the merge step if you need to re-eval any of them.
+- **exp16/17 checkpoints are LOST** — they lived only on the Prime pod
+  filesystem. Eval numbers are recorded below; re-train if needed.
 - **Local repo**: `/Users/dinkarjuyal/Desktop/agents/terminal-contrastive-rl/`,
-  branch `main`, working tree clean, up-to-date with `origin/main`. Latest
-  commit: `848403f Mid-checkpoint evals: DBPO collapsed 100->150; scalar peaks
-  at step 150 (0.366)`.
-- **Outputs from terminated pod**: checkpoints `exp16/{50,100,150,200}` and
-  `exp17/{50,100,150,200}` lived on the pod and ARE LOST. Only the eval
-  numbers (recorded in §"Eval results" below) survived. **If you want to
-  re-eval or fine-tune from these, you must re-train.**
+  branch `main`, clean. Latest commit: `5ec93b0`.
+- **nodeset3 repo**: `~/rl/verifiers/`, branch `main`, SSH remote configured
+  (`git@github-tc-rl:dinkarjuyal/terminal-contrastive-rl.git`). Working tree
+  is clean but may be behind `origin/main` — run `git pull` before editing.
+- **nodeset3 legacy tmux sessions**: many stale sessions from exp8–exp15
+  (all completed). Safe to kill them: `tmux kill-server` or selectively
+  `tmux kill-session -t <name>`.
 
-## What's done (no need to redo)
-1. Critical reviewer pass (§§1–9 of this doc) with 10 weaknesses + 5 novel
-   formulations (DBPO, real ELBO, quantile advantages, surprisal-gating,
-   align+uniform). Reproduce the markdown to see the full review.
-2. DBPO implementation:
-   - `verifiers/rl/trainer/terminal_similarity.py::density_reward_per_rollout`
-   - `verifiers/rl/trainer/generator.py` DBPO branch
-   - `verifiers/rl/trainer/config.py` flags `use_density_tc`, `density_bandwidth`
-3. Scalar self-similarity GRPO baseline implementation:
-   - `verifiers/rl/trainer/config.py` flag `use_scalar_self_sim_grpo`
-   - `verifiers/rl/trainer/generator.py` scalar override branch
-4. Unit tests: `tests/test_terminal_similarity_density.py` (6 tests, all pass).
-5. Configs: `configs/rl/bash_agent_tc_exp{16,17,18_smoke}.toml` (all use
-   `micro_batch_size = 4` — see Pitfalls §6 below for why).
-6. Launch scripts: `scripts/launch_exp{16,17,18_smoke}.sh` (tmux split-window
-   fixed with explicit `-t` target).
-7. Prime Intellect provisioning: `scripts/bootstrap_prime_pod.sh` (defaults to
-   2× A6000_48GB at $1.08/hr).
-8. Full eval results (see "Eval results" section in May-27 session log below).
+## What's done — complete results
 
-## Headline findings (paper-ready)
-1. **DBPO is a documented failure mode.** KDE log-density advantage selects
-   "most average template" without correctness signal. Step-150 collapse:
-   0.232 → 0.241 → 0.223 → **0.054** → 0.036. Never improved over base.
-   Mechanism: entropy 0.66 → 0.30 and tokens/completion 181 → 94 over 200 steps.
-2. **Scalar self-sim GRPO works directionally.** Monotone improvement 0.232 →
-   0.268 → 0.312 → **0.366** → 0.357. Best checkpoint: step 150 (+13.4 pp
-   over base).
-3. **V1/V2 (exp9/10) machinery contributes signal beyond scalar.** Scalar 0.366
-   vs V1 0.714 vs V2 0.723. The variational/vector-λ machinery is NOT
-   decorative — it adds ~35 pp on top of the scalar floor.
-4. **CONFOUND**: exp16/17 used `micro_batch_size = 4` (A6000 OOM forced it down
-   from 8). exp9/10 used `mbs = 8` on H100. This may explain part or all of
-   the 35 pp gap. The cleanest follow-up experiment to resolve this is an
-   `mbs=8` rerun of exp17 on H100.
+| Exp | Method | HW | base | Accuracy | Δ | Notes |
+|-----|--------|----|------|----------|---|-------|
+| Base | — | nodeset3 | 0.562 | 0.562 | — | merged-model eval |
+| Base | — | Prime A6000 | 0.232 | 0.232 | — | LoRA-module eval |
+| Exp6 | Discrete TC + ws | nodeset3 | 0.562 | 0.688 | +13pp | |
+| Exp8 | VarTC V1 skip_ws | nodeset3 | 0.562 | 0.518 | −4pp | |
+| **Exp9** | **VarTC V1 + ws** | **nodeset3** | **0.562** | **0.714** | **+15pp** | **p=0.016** |
+| **Exp10** | **Vector λ V2 + ws** | **nodeset3** | **0.562** | **0.723** | **+16pp** | **best** |
+| Exp10-sw | V2 skip_ws | nodeset3 | 0.562 | 0.348 | −21pp | catastrophic |
+| Exp12 | V1 + ws seed=43 | nodeset3 | 0.562 | 0.714 | +15pp | exact repro |
+| Exp11 | V1 + ws 400 steps | nodeset3 | 0.562 | 0.643 | +8pp | overfit |
+| Exp15 | V2 + ws 400 steps | nodeset3 | 0.562 | 0.000 | −56pp | format collapse |
+| Exp16 | DBPO KDE h=0.2 | Prime A6000 | 0.232 | 0.036 | −20pp | template collapse |
+| **Exp17** | **Scalar self-sim** | **Prime A6000** | **0.232** | **0.357** | **+13pp** | **best ckpt=150: 0.366** |
 
-## Decision tree for paper framing
-The original §10 decision tree at the bottom of this doc anticipated 4
-outcomes. With the eval results, here is the resolved tree:
+**⚠️ Base discrepancy**: nodeset3 merged-model eval gives base=0.562; Prime
+LoRA-module eval gives base=0.232. Root cause unknown — likely bash environment
+differences (different files/processes) and/or vllm version (0.17.1 vs conda).
+Cross-setup comparisons are unreliable until this is diagnosed.
 
-| Original branch | What happened | Implication |
-|---|---|---|
-| exp17 ≥ exp9 | NO (0.366 vs 0.714) | Cannot pivot to "scalar is sufficient" |
-| exp16 > exp9 | NO (0.036 vs 0.714, catastrophic) | DBPO is NOT the headline method |
-| exp16 ≈ exp17 ≈ exp9 | NO | Not equivalent |
-| exp16 < exp17 | YES (0.036 < 0.357) | DBPO is over-engineered AND broken |
+## Highest-priority next action
 
-So the paper framing is: **"a single H100-class verifier-free baseline (V1) and
-two negative results (DBPO collapses, scalar is partial), all three reported
-in a unified framework."** The three findings above are the contribution.
-
-## Three concrete continuation paths
-
-### Path A — Resolve the mbs confound (highest scientific value)
-Goal: determine how much of the 35 pp gap between scalar (0.366) and V1 (0.714)
-is method vs batch-size noise.
-
-1. SSH to nodeset3, check `nvidia-smi` for free GPUs (need 2 contiguous H100s).
-2. If contended, deploy `scripts/auto_launch_exp16_17.sh` again BUT FIX the
-   memory-threshold bug (line that checks free memory; it required >32 GB
-   free which never holds at gpu-util=0.4; just remove or lower the threshold).
-3. Reset `micro_batch_size = 8` in `configs/rl/bash_agent_tc_exp17.toml`.
-4. Run exp17 (200 steps) on H100. Expect ~3 hours wall-clock.
-5. Eval against base/exp9/exp10. If accuracy ≥ 0.6, the mbs hypothesis is
-   confirmed; if still ≤ 0.4, the scalar method itself is the bottleneck.
-
-### Path B — Salvage DBPO with entropy regularisation
-Goal: test whether DBPO collapses *because* of high-density advantage or because
-of zero entropy floor. Hypothesis: adding `entropy_coef = 0.01` to the GRPO loss
-prevents the collapse.
-
-1. In `verifiers/rl/trainer/trainer.py` (or wherever the GRPO loss is built),
-   confirm there is no entropy bonus by default. There isn't — it would need to
-   be wired through `RLConfig`.
-2. Add `entropy_coef: float = 0.0` to `verifiers/rl/trainer/config.py::RLConfig`.
-3. In the loss aggregation, subtract `entropy_coef * entropy.mean()`.
-4. Create `configs/rl/bash_agent_tc_exp19.toml`: clone of exp16 with
-   `entropy_coef = 0.01` and `max_steps = 50` (smoke).
-5. Launch on Prime A6000 again. If entropy stays ≥ 0.5 and eval(step-50)
-   ≥ 0.25, scale to 200 steps. If it still drifts, DBPO is fundamentally
-   broken regardless of regularisation.
-
-### Path C — Write the paper now (no more experiments)
-Goal: lock in the three findings as a publication.
-
-The three findings above ARE the contribution. A paper draft can be structured:
-1. Intro: verifier-free RL for open-ended environments.
-2. Framework: weight-synced GRPO + similarity-based reward family.
-3. Methods, ordered by signal strength:
-   - Scalar self-sim (the floor, exp17): a single number per pair.
-   - V1 variational (exp9): pair-selection + ELBO surrogate.
-   - V2 vector-λ (exp10): per-token weighting.
-4. Negative result: DBPO (KDE log-density) collapses to "most average template".
-5. Discussion: density-based advantages need an entropy floor or KL anchor.
-
-The "negative result" framing is unusual but valuable. Cite the exp16 entropy
-trajectory + mid-training accuracy table as primary evidence.
-
-## Quick start (if resuming experiments)
+**Run exp17 (scalar self-sim) on nodeset3 with `mbs=8`** — this is the single
+experiment that unblocks the paper. It resolves whether the ~35pp gap between
+scalar (0.357) and V1 (0.714) is method or batch-size noise.
 
 ```bash
-cd /Users/dinkarjuyal/Desktop/agents/terminal-contrastive-rl
-git status   # confirm clean and on main
+# 1. Pull latest code on nodeset3:
+ssh nodeset3 'cd ~/rl/verifiers && git pull'
 
-# Path A (nodeset3 H100, ~3 hours, free):
-ssh nodeset3 'nvidia-smi --query-gpu=index,memory.used --format=csv,noheader'
-# if free GPUs exist (look for 0 MiB used on at least 2):
-# 1) Edit configs/rl/bash_agent_tc_exp17.toml: micro_batch_size = 8
-# 2) Edit scripts/launch_exp17.sh: use the nodeset3 GPU indices
-# 3) ssh nodeset3 && bash launch_exp17.sh
+# 2. Edit config — change micro_batch_size from 4 to 8:
+# File: configs/rl/bash_agent_tc_exp17.toml  line: micro_batch_size = 4 → 8
+# Also rename the output dir to avoid collision:
+# output_dir = "outputs/bash-agent-tc-exp17-mbs8"
 
-# Path B / C / new experiments on Prime (~$10-30):
-bash scripts/bootstrap_prime_pod.sh         # provisions 2x A6000
-# then follow the pitfall checklist in §"Pitfalls hit on this pod" below
+# 3. Launch on GPU0 (free) + GPU1 (if tiny_vlm job has cleared it):
+# Check first: ssh nodeset3 nvidia-smi
+# If GPU1 still occupied, wait or use a Prime pod (2x A6000, bootstrap_prime_pod.sh)
+
+# 4. Eval using the nodeset3 merged-model approach (run_eval_v2.sh):
+# bash /tmp/run_eval_v2.sh exp17-mbs8 <checkpoint-200-path> 0 8099
 ```
 
-## Eval recipe (validated on May 27)
+Expected wall-clock: ~3h on 2× H100. If the result is ≥ 0.60, the mbs
+confound explains the gap and the paper needs no more experiments. If ≤ 0.45,
+the scalar method is genuinely weaker and the variational machinery earns its
+keep with a clean ablation story.
 
+## Secondary actions (do after mbs experiment)
+
+### A — Diagnose base accuracy discrepancy
+Run precision_check on base model (no LoRA) on nodeset3 using the Prime pod's
+eval recipe (LoRA-module vllm, not merged model):
 ```bash
-# On a pod with a trained checkpoint at outputs/<run>/checkpoint-N:
-# 1) Start vllm with the LoRA module(s):
+# On nodeset3, GPU0:
+CUDA_VISIBLE_DEVICES=0 /home/ubuntu/miniconda3/envs/vllm/bin/vf-vllm \
+  --model Qwen/Qwen2.5-1.5B-Instruct --enforce-eager \
+  --port 8099 --gpu-memory-utilization 0.40 \
+  --enable-auto-tool-choice --tool-call-parser hermes \
+  --enable-lora --max-loras 1 --max-lora-rank 16 \
+  --lora-modules base=/tmp/merged_exp9 &   # use exp9 checkpoint as proxy
+# then run precision_check with --model base
+# if result ≈ 0.232 → the gap is eval-methodology, not env
+# if result ≈ 0.562 → the gap is environment (different machine filesystem)
+```
+
+### B — Write the paper (Path C, no more experiments needed)
+The three-finding structure is complete:
+1. Variational self-consistency + weight-sync = +15pp (exp9/10, p<0.05)
+2. Scalar self-sim = partial signal (+13pp before mbs-resolved)
+3. DBPO (density reward) = catastrophic collapse (documented failure mode)
+
+Draft outline in §"What a Publishable Paper Looks Like" below.
+
+## Eval recipes
+
+### nodeset3 merged-model eval (validated, gives base=0.562)
+```bash
+# Script on nodeset3: /tmp/run_eval_v2.sh
+# Usage: bash /tmp/run_eval_v2.sh <exp_name> <checkpoint_path> <gpu_id> <port>
+bash /tmp/run_eval_v2.sh exp9 ~/rl/verifiers/outputs/bash-agent-tc-exp9/checkpoint-200 0 8099
+# Results in /tmp/prec_<exp_name>.log
+```
+
+### Prime pod LoRA-module eval (validated, gives base=0.232)
+```bash
 CUDA_VISIBLE_DEVICES=0 .venv/bin/vf-vllm \
   --model Qwen/Qwen2.5-1.5B-Instruct --enforce-eager \
   --port 8000 --gpu-memory-utilization 0.4 \
   --enable-auto-tool-choice --tool-call-parser hermes \
   --enable-lora --max-loras 8 --max-lora-rank 16 \
-  --lora-modules run_a=/path/to/checkpoint-200
-
-# 2) Run eval (NOTE: redirect to file, output is large and SSH may time out):
+  --lora-modules run_a=/path/to/checkpoint-200 &
+# wait for /health 200, then:
 PYTHONPATH=$(pwd):$(pwd)/environments .venv/bin/python \
   environments/bash_agent/precision_check.py \
-  --model run_a --label run_a --port 8000 \
-  > /tmp/eval_run_a.log 2>&1
-
-# 3) Final line gives rollout accuracy. Compare to base=0.232, V1=0.714.
+  --model run_a --label run_a --port 8000 > /tmp/eval_run_a.log 2>&1
 ```
 
 ## DO NOT FORGET
-- **Terminate any Prime pod you create** as soon as eval finishes:
-  `prime pods terminate <pod-id>`. At $1.08/hr a forgotten pod costs ~$26/day.
-- Verify `prime pods list` returns 0 pods before considering a session done.
-- Always commit and push before terminating — the pod's filesystem is gone.
+- Terminate Prime pods immediately after eval: `prime pods terminate <id>`
+  ($1.08/hr = ~$26/day if forgotten). Confirm with `prime pods list`.
+- Always `git commit && git push` before terminating a pod.
+- Use `exp18_smoke` (`max_steps=2`) to validate any new GPU/environment before
+  committing to a 200-step run.
+- nodeset3 git remote uses SSH deploy key (`~/.ssh/tc_rl_deploy`), not a token.
 
 ---
 
