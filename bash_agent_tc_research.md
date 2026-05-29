@@ -103,11 +103,13 @@ ssh nodeset3 'nvidia-smi --query-gpu=index,memory.used --format=csv,noheader'
 # 1. Sync repo to nodeset3:
 ssh nodeset3 'cd ~/rl/verifiers && git pull'
 
-# 2. Edit configs/rl/bash_agent_tc_exp17.toml on nodeset3:
-#     - micro_batch_size: 4 -> 8
-#     - run_name = "bash-agent-tc-exp17-mbs8" (avoid output dir collision)
+# 2. Config is already prepared at configs/rl/bash_agent_tc_exp17_mbs8.toml
+#    (mbs=8, save_steps=50, port 8099, NCCL 51222, run_name=bash-agent-tc-exp17-mbs8).
+#    No editing required.
 
 # 3. Edit scripts/launch_exp17.sh for the actually-free GPU pair, e.g. 0 and 1:
+#     - Point CONFIG at configs/rl/bash_agent_tc_exp17_mbs8.toml
+#     - Update port to 8099 (matches the new config)
 #     - CUDA_VISIBLE_DEVICES on vllm pane: <free-gpu-A>
 #     - CUDA_VISIBLE_DEVICES on trainer pane: <free-gpu-B>
 #     - WORK_DIR, PYTHON, VF_VLLM, port (8003), config file path
