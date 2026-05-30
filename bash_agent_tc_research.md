@@ -1,12 +1,12 @@
 # Verifier-Free RL for Bash Agents via Terminal Contrastive Loss
 
-**Status**: Active research — base-accuracy diagnostic done May 29; exp17-mbs8 not yet launched (waiting for free H100 pair).  
-**Last updated**: May 29, 2026 ~14:30 UTC  
+**Status**: Active research — exp17-mbs8 RUNNING on Prime pod (Lambda H100) since May 30 ~19:00 UTC.  
+**Last updated**: May 30, 2026 ~19:30 UTC  
 **Model**: Qwen2.5-1.5B-Instruct
 
 ---
 
-# RESUME HANDOFF (last updated: May 29, 2026)
+# RESUME HANDOFF (last updated: May 30, 2026)
 
 If you are an agent resuming this work, read this section FIRST. The session
 logs lower in this doc have full experimental detail.
@@ -62,81 +62,59 @@ exp17-mbs8 on nodeset3 → compare to exp9 (0.714) — both nodeset3, both mbs=8
 
 ## Infrastructure state — IMPORTANT
 
-- **0 Prime Intellect pods.** `prime pods list` is empty. No billing.
-- **nodeset3 GPUs** — fluid state. As of last check (~14:20 UTC May 29):
+- **1 Prime Intellect pod ACTIVE**: `dab10daea9454622bd5070a42a0f8080`
+  - SSH: `ssh -i ~/.ssh/primeintellect_ed25519 -p 1234 root@192.222.55.201`
+    (verify current IP with `prime pods status dab10daea9454622bd5070a42a0f8080 --output json`)
+  - 2× H100 80GB SXM5 (Lambda Labs, US), $8.38/hr
+  - exp17-mbs8 training in tmux session `bash-agent-tc-exp17-mbs8`
+  - vllm on GPU0:8099, trainer on GPU1
+  - Step ~12/200 as of 19:30 UTC May 30; ~4h remaining (~23:30 UTC)
+  - Checkpoints saved every 50 steps to `/root/terminal-contrastive-rl/outputs/bash-agent-tc-exp17-mbs8/`
+  - Trainer log: `/tmp/trainer_exp17_mbs8.log`
+  - Eval script ready at: `/root/run_eval_exp17_mbs8.sh`
 
-  | GPU | Memory | Status |
-  |-----|--------|--------|
-  | 0 | 0 MiB | **FREE** (base-diag vllm just killed) |
-  | 1 | 24.8 GB | busy (tiny_vlm) |
-  | 2 | 26.2 GB | busy (tiny_vlm) |
-  | 3–7 | 23–33 GB each | busy (tiny_vlm) |
+- **nodeset3**: IP 34.86.165.36 — **UNREACHABLE** as of May 30 (SSH timeout). Node may have been terminated or reprovisioned.
+- **nodeset3 merged checkpoints** in `/tmp/merged_exp{8,9,10,10-sw,11,12,15}` — **INACCESSIBLE** until node recovers.
+- **Local repo**: `/Users/dinkarjuyal/Desktop/agents/terminal-contrastive-rl/`, branch `main`, clean. Latest commit: `2b82b7c`.
 
-  Earlier the same day they were all at 40–75 GB and 88–95 % util. So one of
-  the unrelated jobs (likely the older tiny_vlm batch from ~14 h ago) finished
-  freeing GPU 0. Re-check with `ssh nodeset3 nvidia-smi` before launching.
+## Prime pod bootstrap notes (for next pod, if needed)
 
-- **nodeset3 merged checkpoints** still in `/tmp/merged_exp{8,9,10,10-sw,11,12,15}`.
-- **exp16/17 checkpoints LOST** (Prime pod terminated). Eval numbers preserved
-  in this doc; need re-training to recover the models.
-- **Local repo**: `/Users/dinkarjuyal/Desktop/agents/terminal-contrastive-rl/`,
-  branch `main`, clean. Latest commit: `f40115a` (May 27 RESUME HANDOFF added).
-- **nodeset3 repo**: `~/rl/verifiers/`, branch `main`. Run `git pull` before edits.
+The `cuda_12_6_pytorch_2_7` image has Python 3.10 and requires these fixes:
+1. `pip install vllm==0.17.1 --extra-index-url https://download.pytorch.org/whl/cu126`
+   → installs torch 2.10.0+cu126, CUDA works
+2. **flash-attn cannot be used** (ABI mismatch between vllm's cu126 torch and flash-attn's precompiled binary). Train without it — fine for 1.5B on 80GB.
+3. `pip install -e . --no-deps && pip install transformers>=4.56.2 accelerate peft wandb trl>=0.17.0 liger-kernel deepspeed requests openai-agents tomli tf-keras`
+4. Add `FLASHINFER_DISABLE_VERSION_CHECK=1` to vllm launch command
+5. Patch `bash_agent.py` line 128: wrap `import tomllib` in try/except with `import tomli as tomllib`
+6. All commands in `/root/launch_exp17_mbs8_prime.sh` and `/root/run_eval_exp17_mbs8.sh` on the pod
 
 ## Next actions — strict priority order
 
-### Priority 1 — Run exp17-mbs8 on nodeset3 (BLOCKER for paper)
-
-**Why this is the single most important experiment**: it isolates whether the
-"V1 dominates scalar" claim is real method advantage or batch-size noise, in
-the same bash environment so the base-rate confound is removed.
-
-GPU 0 is currently free. The launch needs TWO GPUs (vllm + trainer with NCCL
-weight sync). Need to wait for or claim GPU 1 (or any other) to free up. Best
-candidates to monitor: GPU 1 and GPU 2 (smaller memory footprint than 3–7,
-suggesting nearer completion).
+### Priority 1 — Eval exp17-mbs8 when training completes (~23:30 UTC May 30)
 
 ```bash
-# 0. Confirm two GPUs are free:
-ssh nodeset3 'nvidia-smi --query-gpu=index,memory.used --format=csv,noheader'
+# Check training progress
+ssh -i ~/.ssh/primeintellect_ed25519 -p 1234 root@<pod-ip> \
+  'grep "Step [0-9]" /tmp/trainer_exp17_mbs8.log | tail -3'
 
-# 1. Sync repo to nodeset3:
-ssh nodeset3 'cd ~/rl/verifiers && git pull'
+# When step 200 checkpoint appears:
+ssh -i ~/.ssh/primeintellect_ed25519 -p 1234 root@<pod-ip> \
+  'bash /root/run_eval_exp17_mbs8.sh 200 1'
 
-# 2. Config is already prepared at configs/rl/bash_agent_tc_exp17_mbs8.toml
-#    (mbs=8, save_steps=50, port 8099, NCCL 51222, run_name=bash-agent-tc-exp17-mbs8).
-#    No editing required.
-
-# 3. Edit scripts/launch_exp17.sh for the actually-free GPU pair, e.g. 0 and 1:
-#     - Point CONFIG at configs/rl/bash_agent_tc_exp17_mbs8.toml
-#     - Update port to 8099 (matches the new config)
-#     - CUDA_VISIBLE_DEVICES on vllm pane: <free-gpu-A>
-#     - CUDA_VISIBLE_DEVICES on trainer pane: <free-gpu-B>
-#     - WORK_DIR, PYTHON, VF_VLLM, port (8003), config file path
-#     - Output dir of the run
-
-# 4. Launch:
-ssh nodeset3 'bash ~/rl/verifiers/scripts/launch_exp17.sh'
-
-# 5. Monitor (~3h on H100):
-ssh nodeset3 'tail -f /tmp/trainer_exp17.log'
-
-# 6. CRITICAL CHECKPOINT: at step 4, verify NO OOM. If OOM, drop mbs to 6 or
-#    re-confirm OOM was an A6000-specific issue not present on H100 80GB.
-
-# 7. Eval the final checkpoint using nodeset3's existing recipe:
-ssh nodeset3 'bash /tmp/run_eval_v2.sh exp17-mbs8 \
-    ~/rl/verifiers/outputs/bash-agent-tc-exp17-mbs8/checkpoint-200 0 8099'
-# Then: grep "Rollout accuracy" /tmp/prec_exp17-mbs8.log
+# Read result:
+ssh -i ~/.ssh/primeintellect_ed25519 -p 1234 root@<pod-ip> \
+  'cat /tmp/eval_result_exp17_mbs8_step200.log | grep -i "accuracy\|rollout"'
 ```
+
+**Remember**: Prime base = 0.232. Compare Δ over base.
 
 **Expected outcomes and what they mean:**
 
-| Eval result | Interpretation |
-|-------------|----------------|
-| **0.60–0.75** (≈ exp9/10) | mbs=4 was the entire issue. Scalar self-sim is comparable to V1/V2. Paper pivots to "self-similarity is sufficient, variational machinery decorative." |
-| **0.45–0.55** | Method gap is real but smaller than previously thought. Mixed contribution paper: both findings reported. |
-| **0.30–0.45** | Same as Prime result, mbs didn't matter. V1/V2 machinery wins. Strong paper. |
+| Eval result | Δ over Prime base (0.232) | Interpretation |
+|-------------|--------------------------|----------------|
+| **0.35–0.40** (≈ exp17 on A6000) | **+12–17 pp** | mbs=8 same as mbs=4 on Prime. Scalar self-sim is the story. |
+| **0.55–0.70** | **+32–47 pp** | mbs=8 dramatically better; Prime A6000 OOM'd differently. H100-vs-A6000 confound. Need nodeset3 re-run. |
+| **0.25–0.35** | **+2–12 pp** | Training not working on Prime. Environment/vllm issue. |
 | **< 0.30 or collapse** | Something is fundamentally different about the nodeset3 conda vllm path. Investigate. |
 
 ### Priority 2 — Same-env exp9 reproducibility (if time permits)
