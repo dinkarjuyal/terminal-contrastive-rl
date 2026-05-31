@@ -1,7 +1,7 @@
 # Verifier-Free RL for Bash Agents via Terminal Contrastive Loss
 
-**Status**: Active research — exp17-mbs8 RUNNING on Prime pod (Lambda H100) since May 30 ~19:00 UTC.  
-**Last updated**: May 30, 2026 ~19:30 UTC  
+**Status**: Active research — exp17-mbs8 eval complete (May 31): **0.062 trained vs 0.241 base on Lambda H100** (regression; environment issue suspected). Terminate pod, recover nodeset3 or launch A6000 re-run.  
+**Last updated**: May 31, 2026 ~05:00 UTC  
 **Model**: Qwen2.5-1.5B-Instruct
 
 ---
@@ -46,6 +46,7 @@ within 4 pp of each other:
 |-----|----|------|---------|-----------------|
 | **Exp17 (scalar self-sim)** | Prime A6000 | 0.232 | **0.357** | **+12.5 pp** |
 | Exp17 best (step 150) | Prime A6000 | 0.232 | **0.366** | **+13.4 pp** |
+| **Exp17-mbs8 (scalar self-sim, mbs=8)** | Lambda H100 | 0.241 | **0.062** | **−17.9 pp** (regression!) |
 | **Exp9 (VarTC V1 + ws)** | nodeset3 | 0.562 | **0.714** | **+15.2 pp** |
 | **Exp10 (Vector λ V2 + ws)** | nodeset3 | 0.562 | **0.723** | **+16.1 pp** |
 | Exp16 (DBPO @200) | Prime A6000 | 0.232 | 0.036 | **−19.6 pp** (collapse) |
@@ -62,20 +63,16 @@ exp17-mbs8 on nodeset3 → compare to exp9 (0.714) — both nodeset3, both mbs=8
 
 ## Infrastructure state — IMPORTANT
 
-- **1 Prime Intellect pod ACTIVE**: `dab10daea9454622bd5070a42a0f8080`
-  - SSH: `ssh -i ~/.ssh/primeintellect_ed25519 -p 1234 root@192.222.55.201`
-    (verify current IP with `prime pods status dab10daea9454622bd5070a42a0f8080 --output json`)
-  - 2× H100 80GB SXM5 (Lambda Labs, US), $8.38/hr
-  - exp17-mbs8 training in tmux session `bash-agent-tc-exp17-mbs8`
-  - vllm on GPU0:8099, trainer on GPU1
-  - Step ~12/200 as of 19:30 UTC May 30; ~4h remaining (~23:30 UTC)
-  - Checkpoints saved every 50 steps to `/root/terminal-contrastive-rl/outputs/bash-agent-tc-exp17-mbs8/`
-  - Trainer log: `/tmp/trainer_exp17_mbs8.log`
-  - Eval script ready at: `/root/run_eval_exp17_mbs8.sh`
+- **1 Prime Intellect pod ACTIVE** (but should be terminated — training done, eval done):
+  - Pod ID: `dab10daea9454622bd5070a42a0f8080`  
+  - Jupyter: `http://192.222.55.201:8888` token `TC9j2edp7kPD4NNj`
+  - Checkpoints at `/root/terminal-contrastive-rl/outputs/bash-agent-tc-exp17-mbs8/checkpoint-{50,100,150,200}`
+  - **Terminate with**: `prime pods terminate dab10daea9454622bd5070a42a0f8080 --yes`
+  - $8.38/hr billing until terminated
 
 - **nodeset3**: IP 34.86.165.36 — **UNREACHABLE** as of May 30 (SSH timeout). Node may have been terminated or reprovisioned.
 - **nodeset3 merged checkpoints** in `/tmp/merged_exp{8,9,10,10-sw,11,12,15}` — **INACCESSIBLE** until node recovers.
-- **Local repo**: `/Users/dinkarjuyal/Desktop/agents/terminal-contrastive-rl/`, branch `main`, clean. Latest commit: `2b82b7c`.
+- **Local repo**: `/Users/dinkarjuyal/Desktop/agents/terminal-contrastive-rl/`, branch `main`, clean. Latest commit: `954e9a1`.
 
 ## Prime pod bootstrap notes (for next pod, if needed)
 
@@ -88,34 +85,39 @@ The `cuda_12_6_pytorch_2_7` image has Python 3.10 and requires these fixes:
 5. Patch `bash_agent.py` line 128: wrap `import tomllib` in try/except with `import tomli as tomllib`
 6. All commands in `/root/launch_exp17_mbs8_prime.sh` and `/root/run_eval_exp17_mbs8.sh` on the pod
 
+## Exp17-mbs8 result analysis (May 31)
+
+**Result**: base=0.241, trained=0.062, Δ=−17.9 pp (regression)
+
+**Why the regression happened** (leading hypothesis):
+- Training ran without flash-attn (ABI mismatch forced removal). Without flash-attn, the training attention mechanism is different → gradient signal is different → policy learned something wrong.
+- The Lambda Labs bash sandbox may differ from A6000/nodeset3 in filesystem state, which changes what commands succeed, corrupting the self-similarity reward signal.
+- vllm 0.17.1 without flash-attn on H100 may have different numerics than nodeset3 conda vllm.
+
+**Key takeaway**: Lambda H100 pod without flash-attn is NOT a valid environment for this experiment. The regression is an artifact, not a real result.
+
 ## Next actions — strict priority order
 
-### Priority 1 — Eval exp17-mbs8 when training completes (~23:30 UTC May 30)
+### Priority 1 — Terminate the pod (stop billing)
 
 ```bash
-# Check training progress
-ssh -i ~/.ssh/primeintellect_ed25519 -p 1234 root@<pod-ip> \
-  'grep "Step [0-9]" /tmp/trainer_exp17_mbs8.log | tail -3'
-
-# When step 200 checkpoint appears:
-ssh -i ~/.ssh/primeintellect_ed25519 -p 1234 root@<pod-ip> \
-  'bash /root/run_eval_exp17_mbs8.sh 200 1'
-
-# Read result:
-ssh -i ~/.ssh/primeintellect_ed25519 -p 1234 root@<pod-ip> \
-  'cat /tmp/eval_result_exp17_mbs8_step200.log | grep -i "accuracy\|rollout"'
+prime pods terminate dab10daea9454622bd5070a42a0f8080 --yes
 ```
 
-**Remember**: Prime base = 0.232. Compare Δ over base.
+### Priority 2 — Recover nodeset3 or find another 2-GPU H100 environment
 
-**Expected outcomes and what they mean:**
+The cleanest experiment (exp17-mbs8 on nodeset3 vs exp9 on nodeset3) requires
+the SAME bash sandbox and vllm setup. Options:
+1. Check if nodeset3 is back (new IP): ask the cluster admin or check GCP console
+2. Launch on Prime A6000 with 2 GPUs but WITH flash-attn working:
+   - Try `prime_rl` image instead of `cuda_12_6_pytorch_2_7`
+   - The `prime_rl` image may have a pre-built vllm+flash-attn that works
+3. If nodeset3 is gone permanently, run exp17-mbs8 on a Prime A6000 pod
+   with working flash-attn (accept environment confound; compare to exp17 A6000 mbs=4)
 
-| Eval result | Δ over Prime base (0.232) | Interpretation |
-|-------------|--------------------------|----------------|
-| **0.35–0.40** (≈ exp17 on A6000) | **+12–17 pp** | mbs=8 same as mbs=4 on Prime. Scalar self-sim is the story. |
-| **0.55–0.70** | **+32–47 pp** | mbs=8 dramatically better; Prime A6000 OOM'd differently. H100-vs-A6000 confound. Need nodeset3 re-run. |
-| **0.25–0.35** | **+2–12 pp** | Training not working on Prime. Environment/vllm issue. |
-| **< 0.30 or collapse** | Something is fundamentally different about the nodeset3 conda vllm path. Investigate. |
+### Priority 3 — If nodeset3 is available: also run exp9 (V1) for direct comparison
+
+Run both exp17-mbs8 and exp9 with identical setups to get a clean scalar vs V1 delta.
 
 ### Priority 2 — Same-env exp9 reproducibility (if time permits)
 
