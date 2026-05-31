@@ -144,6 +144,98 @@ Like" lower in this doc) needs updates given the May-29 diagnostic:
    near-baseline (0.223) to broken (0.054). Use as a cautionary "what
    doesn't work" section.
 
+### Priority 4 — Vector Policy Optimization (VPO) — open research direction
+
+V2 (exp10) already does a primitive form of vector reward — it computes a 3-axis
+reward `(strict_sim, jaccard_sim, exit_success)` and collapses it per-step with a
+**Dirichlet-sampled** weighting `λ ~ Dir(α=1.0)`. This worked: +16.1 pp, best
+single result, ~1 pp above scalar V1. So vector reward is empirically real here.
+
+VPO asks: **what if we don't collapse the vector at all?** Pedagogical / privileged
+teachers can return per-axis feedback that's not derivable from rollouts alone
+(e.g. `(answer_correct, reasoning_consistent, tool_call_valid, brevity, …)`).
+Scalarising discards exactly the information the privileged teacher was added to
+inject.
+
+#### Spectrum of vector-reward update rules
+
+| Approach | Update rule | When it earns its keep |
+|----------|-------------|------------------------|
+| Fixed linear weight (`w · A_vec`) | Hand-tuned, single update direction | Baseline only |
+| **Dirichlet mixing (V2)** | `λ ~ Dir(α)` per step, `A = λ · A_vec` | Random regularisation across axes — current best in this repo |
+| Worst-axis (max-min) | `A_scalar = min_k A_k` | Guarantees improvement on every axis; slow when one axis is hard |
+| **MGDA / multi-gradient descent** (Désidéri 2012) | Compute K gradients, find α ∈ Δ^{K-1} minimising `‖Σ α_k g_k‖²` | Pareto-stationary, automatically up-weights complementary axes, down-weights contradictory ones. **Strictly more expressive than any fixed/random scalarisation** when axes carry independent info |
+| Adaptive per-axis weighting | Weight axis k inversely to current policy's performance on k | Spends gradient where it's most needed; needs per-axis eval signal during training |
+| Multi-head policy | K policy heads, each maximises own `A_k`, mixed at inference | Each axis gets clean signal; mixing rule at inference is an open problem |
+
+#### The MGDA-VPO algorithm sketch
+
+```python
+# Per group of G=8 rollouts:
+A_vec[i] = teacher_or_critic(rollout_i)            # shape (G, K)
+
+# Per-axis advantage z-scored over the group:
+A_k[i] = (A_vec[i, k] - mean_k) / std_k
+
+# K policy gradients (each is a normal PG with a different advantage):
+g_k = E[∇ log π_θ(τ) · A_k(τ)]                     # K backward passes
+
+# MGDA convex combination:
+α* = argmin_{α ∈ simplex}  ‖Σ_k α_k g_k‖²
+
+# Apply
+θ ← θ + η · Σ_k α_k* g_k
+```
+
+Property: when all K gradients point similarly → α* uniform → reduces to averaging.
+When axes conflict → α* picks the compromise that improves *all* axes
+simultaneously (or stops if no such direction exists, which is itself a useful
+signal: a real Pareto trade-off exists, and we've found it).
+
+#### Concrete next experiment (Exp19 — MGDA-VPO)
+
+Drop-in replacement for V2's mixing step:
+
+1. Reuse V2's three reward axes: `strict_sim`, `jaccard_sim`, `exit_success`.
+2. Compute three z-scored advantages (instead of one Dirichlet-mixed advantage).
+3. Compute three policy gradients (three masked-backward passes, or one fused
+   pass with three loss heads — implementation-wise the cheapest path is to call
+   the policy loss three times with different advantage vectors and accumulate).
+4. Solve the 3-simplex MGDA QP analytically (closed-form for K≤3) per step.
+5. Compare to V2 (Dirichlet-mixed) and V1 (single scalar).
+
+Expected: with three correlated axes (`strict_sim ≈ jaccard_sim`), MGDA-VPO will
+behave like averaging and land within ±2 pp of V2. **The interesting test is to
+add deliberately uncorrelated axes** — e.g. add a brevity penalty and a
+tool-call-format validity check — and see whether MGDA-VPO opens a gap.
+
+#### Why this is the right next direction *after* the paper
+
+- The three findings of the paper (variational works, scalar works, DBPO fails)
+  are already complete and don't depend on VPO.
+- VPO is naturally a **follow-up paper** about *how* to design the reward axes
+  and *how* to combine them, building on the same weight-synced GRPO + bash
+  environment substrate.
+- It also generalises directly to non-bash domains where privileged teachers
+  are more easily definable (math with step-level checks, code with unit-test
+  granularity, agentic tasks with intermediate state visibility).
+
+#### Risk
+
+If the per-axis advantages turn out to be highly correlated estimates of the
+same underlying "goodness" (which is plausible for `strict_sim` and `jaccard_sim`
+— both measure output similarity), MGDA-VPO degenerates to averaging and you've
+paid K× compute for nothing. The empirical question is whether well-chosen axes
+*can* be made uncorrelated enough to make VPO earn its keep — and that question
+is itself the research contribution.
+
+#### Open questions for VPO
+
+- **Critic architecture**: K separate critics, or one critic with K-headed output?
+- **Compute cost**: K backward passes is 3–5× the trainer cost. Is there a single-backward variant that approximates MGDA?
+- **Stability**: Does MGDA's "stop when no improving direction exists" behaviour interact badly with GRPO's group-mean centring (which can push α* away from improving directions early in training)?
+- **Adaptive K**: Can we learn which axes to track? Start with K=10, prune axes whose α* drops below threshold?
+
 ## Pitfalls to remember on resume
 
 1. **vllm version** — repo's `server.py` calls `init_app_state(engine, app.state, args)` (3-arg). vllm ≥ 0.17.1 expects 3 args, vllm 0.11 expects 4. The conda env on nodeset3 has 0.17.1 — should work.
