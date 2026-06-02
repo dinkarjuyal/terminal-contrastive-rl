@@ -1,0 +1,459 @@
+\documentclass[11pt,a4paper]{article}
+
+% ── Packages ──────────────────────────────────────────────────────────
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{subcaption}
+\usepackage{bm}
+
+% ── Macros ────────────────────────────────────────────────────────────
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\argmin}{\operatorname*{arg\,min}}
+\newcommand{\argmax}{\operatorname*{arg\,max}}
+\DeclareMathOperator*{\diag}{diag}
+
+% ── Title ─────────────────────────────────────────────────────────────
+\title{Vector Policy Optimization:\\Learning from Structured Privileged Feedback\\[6pt]
+{\large Draft --- For Internal Discussion}}
+\author{Terminal Contrastive RL Project}
+\date{June 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Standard reinforcement learning from human feedback (RLHF) collapses all
+feedback into a single scalar reward.  When a \emph{privileged teacher}
+can provide structured, multi-axis feedback---answer correctness,
+reasoning consistency, tool-call validity, brevity---scalarisation
+discards precisely the information the teacher was introduced to inject.
+We propose \textbf{Vector Policy Optimization (VPO)}, a family of
+update rules that preserve the vectoriality of the reward signal at the
+gradient level.  We present a spectrum from fixed-weight scalarisation
+through Dirichlet random mixing (already validated in our Vector-$\lambda$
+V2 experiments, $+16.1$ pp over base) to \textbf{MGDA-VPO}, which
+computes per-axis policy gradients and combines them via a convex
+optimisation on the simplex that guarantees Pareto-stationary updates.
+We sketch a concrete experiment (Exp19), analyse when VPO earns its keep
+vs.\ degenerating to averaging, and identify open questions around critic
+architecture, compute cost, and stability.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ======================================================================
+\section{Motivation: Why Scalar Rewards Waste Privileged Information}
+\label{sec:motivation}
+
+The standard policy gradient maximises expected advantage:
+\begin{equation}
+  \nabla J(\theta) \;=\; \E_{\tau \sim \pi_\theta}\!\Big[
+    \nabla \log \pi_\theta(\tau) \;\cdot\; A(\tau)
+  \Big],
+  \qquad A(\tau) \in \R.
+  \label{eq:pg-scalar}
+\end{equation}
+The advantage $A(\tau)$ is a single number.  When a privileged teacher
+returns a vector of feedback signals $\bm{R}(\tau) \in \R^K$, the
+conventional pipeline reduces it to a scalar via a fixed or random
+weighted sum \emph{before} computing the gradient.  This is informationally
+lossy: a trajectory that is right on $K{-}1$ axes but wrong on one gets
+the same scalar as a trajectory that is mediocre on all axes.
+
+\paragraph{Example.}
+Consider a bash agent rollout that produces the correct answer but uses
+an invalid tool-call format.  A 5-axis teacher returns
+\[
+  \bm{A}(\tau) = (\underbrace{+1}_{\text{correct}},\;
+                   \underbrace{+1}_{\text{reasoning}},\;
+                   \underbrace{-1}_{\text{tool format}},\;
+                   \underbrace{+1}_{\text{state match}},\;
+                   \underbrace{-0.5}_{\text{verbose}}).
+\]
+Scalarising with equal weights gives $A = +0.3$---``this trajectory was
+$0.3$ good.''  The gradient says ``do more of this, a bit,'' and the
+model slowly drifts.  A vector update can say: ``fix the tool call; the
+rest is fine.''  That targeted signal is exactly what pedagogical RL is
+for, and scalarisation destroys it.
+
+\paragraph{The exploration problem.}
+On-policy RL already struggles when the policy rarely samples correct
+trajectories: the gradient has no positive examples to learn from.
+Pedagogical RL addresses this by injecting trajectories or rewards the
+policy could not produce itself.  Scalarising the teacher's feedback
+partially negates this injection: we brought in structured information
+and then threw away the structure.
+
+% ======================================================================
+\section{Background: What We Already Know Works}
+\label{sec:background}
+
+\subsection{Scalar self-similarity (Exp17)}
+
+The simplest verifier-free reward: for each rollout $i$ in a group of
+$G{=}8$, compute mean pairwise terminal similarity
+\[
+  z_i = \frac{1}{G{-}1}\sum_{j \neq i} \mathrm{sim}(\mathrm{out}_i,\,
+        \mathrm{out}_j),
+\]
+then z-score over the group and use as the GRPO advantage.
+Result: $+12.5$ pp over base on Prime A6000 ($+13.4$ pp at step 150).
+
+\subsection{Variational V1 (Exp9)}
+
+Same scalar $z_i$ but with an explicit variational interpretation and
+weight sync.  Result: $+15.2$ pp over base on nodeset3.
+
+\subsection{Vector-$\lambda$ V2 (Exp10)}
+
+Three reward axes per rollout:
+\begin{equation}
+  \bm{R}_i = \big(\mathrm{strict\_sim}_i,\;\;
+                \mathrm{jaccard\_sim}_i,\;\;
+                \mathrm{exit\_success}_i\big) \in \R^3.
+  \label{eq:v2-reward}
+\end{equation}
+Per training step, sample $\bm{\lambda} \sim \mathrm{Dir}(\alpha{=}1.0)$
+and collapse:
+\begin{equation}
+  R_i = \bm{\lambda} \cdot \bm{R}_i, \qquad
+  A_i = \frac{R_i - \bar{R}}{\mathrm{std}(R)}.
+  \label{eq:v2-dirichlet}
+\end{equation}
+Result: $+16.1$ pp over base---the best single number, but only $\sim$1 pp
+above V1.  The small gap is consistent with the axes being highly
+correlated (both $\mathrm{strict\_sim}$ and $\mathrm{jaccard\_sim}$ measure
+output similarity).
+
+% ======================================================================
+\section{Spectrum of Vector-Reward Update Rules}
+\label{sec:spectrum}
+
+Given a vector advantage $\bm{A}(\tau) \in \R^K$, the design question is:
+\emph{how do we turn it into a parameter update?}
+
+\begin{table}[h]
+\centering
+\caption{Spectrum of vector-reward update rules.}
+\label{tab:spectrum}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Approach} & \textbf{Update rule} & \textbf{When it earns its keep} \\
+\midrule
+Fixed linear weight &
+  $A_{\mathrm{scalar}} = \bm{w} \cdot \bm{A}$ &
+  Baseline only; requires hand-tuning \\[4pt]
+\textbf{Dirichlet mixing (V2)} &
+  $\bm{\lambda} \sim \mathrm{Dir}(\alpha)$ per step &
+  Random regularisation across axes \\[4pt]
+Worst-axis (max-min) &
+  $A_{\mathrm{scalar}} = \min_k A_k$ &
+  Guarantees improvement on every axis; slow \\[4pt]
+\textbf{MGDA} (D\'{e}sid\'{e}ri 2012) &
+  $\argmin_{\bm{\alpha} \in \Delta^{K-1}} \|\sum_k \alpha_k \bm{g}_k\|^2$ &
+  Pareto-stationary; auto-weights complementary axes \\[4pt]
+Adaptive per-axis &
+  Weight axis $k$ $\propto$ policy weakness on $k$ &
+  Spends gradient where needed; needs per-axis eval \\[4pt]
+Multi-head policy &
+  $K$ heads, each maximises own $A_k$; mix at inference &
+  Each axis gets clean signal; mixing rule open \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Key distinction.}
+Approaches 1--3 collapse the vector to a scalar \emph{before} the
+gradient; only MGDA and multi-head preserve vectoriality \emph{at the
+gradient level}.  This is the crucial difference: if you scalarise
+before the backward pass, the gradient has no way to ``unmix'' the
+information.
+
+% ======================================================================
+\section{MGDA-VPO: Algorithm}
+\label{sec:mgda-vpo}
+
+MGDA (Multiple Gradient Descent Algorithm; D\'{e}sid\'{e}ri 2012)
+computes per-objective gradients and finds a convex combination that
+decreases all objectives simultaneously.  Applied to RL with $K$
+advantage axes:
+
+\begin{algorithm}[h]
+\caption{MGDA-VPO}\label{alg:mgda-vpo}
+\begin{algorithmic}[1]
+\Require Policy $\pi_\theta$, $K$ advantage functions $\{A_k\}_{k=1}^K$,
+  learning rate $\eta$, group size $G$
+\For{each training step}
+  \State Generate $G$ rollouts $\{\tau_i\}_{i=1}^G$ via $\pi_\theta$
+  \For{$k = 1, \ldots, K$}
+    \State Compute per-rollout advantage $A_k(\tau_i)$ over the group
+           (z-score normalised)
+    \State Compute gradient $\bm{g}_k \gets
+           \E\big[\nabla_\theta \log \pi_\theta(\tau) \cdot A_k(\tau)\big]$
+           \Comment{$K$ backward passes}
+  \EndFor
+  \State Solve convex QP on the simplex:
+         \[
+           \bm{\alpha}^* = \argmin_{\bm{\alpha} \in \Delta^{K-1}}
+                           \big\|\textstyle\sum_{k=1}^K \alpha_k \bm{g}_k\big\|^2
+         \]
+  \State Update: $\theta \gets \theta + \eta \sum_{k=1}^K \alpha_k^* \bm{g}_k$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Properties.}
+\begin{itemize}[nosep]
+\item When all $K$ gradients point in a similar direction, $\bm{\alpha}^*$
+  is near-uniform and MGDA-VPO reduces to gradient averaging.
+\item When axes conflict, $\bm{\alpha}^*$ picks the compromise direction
+  that improves \emph{all} axes simultaneously.
+\item If no such direction exists (Pareto front reached), $\|\sum
+  \alpha_k^* \bm{g}_k\|^2 = 0$ and the update is zero---this is
+  \emph{not} a bug but a signal: the policy is Pareto-stationary and
+  further improvement requires relaxing one axis.
+\end{itemize}
+
+\paragraph{Closed-form for $K \leq 3$.}
+For $K = 2$, the QP has a closed-form solution (Sener \& Koltun 2018).
+For $K = 3$ (our case with strict/jaccard/exit), the QP can be solved
+analytically or via a single call to a tiny QP solver with negligible
+overhead.
+
+\paragraph{Compute cost.}
+MGDA-VPO requires $K$ backward passes per training step.  For $K = 3$
+this is $3\times$ the backward cost.  Mitigation strategies:
+\begin{itemize}[nosep]
+\item Use a single fused backward with $K$ loss heads (accumulate
+  per-axis $\bm{g}_k$ without materialising $K$ separate
+  backward-call overhead).
+\item Use \emph{ MGDA-Approx}: compute one backward with the
+  Dirichlet-mixed advantage (as in V2), then a second with the
+  \emph{worst-axis} advantage; combine the two gradients via MGDA.
+  This captures most of the benefit at $2\times$ cost.
+\end{itemize}
+
+% ======================================================================
+\section{When Does VPO Earn Its Keep?}
+\label{sec:when}
+
+The central question is not ``is VPO good?'' but rather:
+
+\begin{quote}
+\emph{When are the $K$ reward axes carrying independent information
+that a scalar cannot represent?}
+\end{quote}
+
+\subsection{The degeneracy risk}
+
+If the per-axis advantages are highly correlated estimates of the same
+underlying ``goodness''---as is likely for $\mathrm{strict\_sim}$ and
+$\mathrm{jaccard\_sim}$, both of which measure output similarity---then
+MGDA-VPO degenerates to gradient averaging and we have paid $K\times$
+compute for nothing.
+
+Formally: if $A_k \approx c_k \cdot A_0 + \epsilon_k$ with
+$\mathrm{Var}(\epsilon_k) \ll \mathrm{Var}(c_k A_0)$ for all $k$,
+then $\bm{g}_k \approx c_k \bm{g}_0$ and the simplex solution places
+all weight on the dominant direction regardless of $\bm{\alpha}$.
+
+\subsection{Designing uncorrelated axes}
+
+VPO earns its keep when the axes are \emph{deliberately uncorrelated}.
+In the privileged-teacher setting, this means choosing feedback
+dimensions that probe independent facets of quality:
+
+\begin{table}[h]
+\centering
+\caption{Candidate reward axes for VPO in the bash-agent domain.}
+\label{tab:axes}
+\begin{tabular}{@{}llc@{}}
+\toprule
+\textbf{Axis} & \textbf{Source} & \textbf{Correlation with correctness?} \\
+\midrule
+Answer correctness & Ground-truth oracle & Perfect (dominant axis) \\
+Tool-call format validity & Syntactic check & Moderate \\
+Reasoning consistency & LLM judge or heuristic & Moderate \\
+Brevity (negative length) & Cheap, mechanical & Low \\
+Intermediate env-state match & Privileged env introspection & Low \\
+Exit code 0 & Mechanical & Moderate \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The key insight: axes 3--5 have \textbf{low} correlation with axis 1
+(correctness).  A trajectory can be correct but verbose, or correct but
+use a different internal state path.  These are exactly the dimensions
+where a scalar advantage would conflate ``correct but suboptimal'' with
+``partially correct but efficient,'' and where VPO's gradient-level
+vector preservation can separate the two signals.
+
+\subsection{Empirical test}
+
+The simplest test for axis independence: after collecting $G{=}8$
+rollouts per task across the training set, compute the pairwise Pearson
+correlation matrix of the $K$ advantages.  If all off-diagonal entries
+$|\rho_{jk}| > 0.8$, VPO will not help.  If some $|\rho_{jk}| < 0.5$,
+VPO has room to contribute.
+
+% ======================================================================
+\section{Proposed Experiment: Exp19 --- MGDA-VPO}
+\label{sec:exp19}
+
+A drop-in replacement for V2's Dirichlet mixing step.
+
+\paragraph{Design.}
+\begin{enumerate}
+\item Reuse V2's three reward axes: $\mathrm{strict\_sim}$,
+  $\mathrm{jaccard\_sim}$, $\mathrm{exit\_success}$.
+\item Compute three z-scored advantages $A_{\mathrm{strict}}$,
+  $A_{\mathrm{jaccard}}$, $A_{\mathrm{exit}}$ (instead of one
+  Dirichlet-mixed advantage).
+\item Compute three policy gradients via three masked-backward passes
+  (or one fused pass with three loss heads).
+\item Solve the 3-simplex MGDA QP analytically per step.
+\item Compare to V2 (Dirichlet-mixed) and V1 (single scalar).
+\end{enumerate}
+
+\paragraph{Expected outcome with correlated axes.}
+Since $\mathrm{strict\_sim}$ and $\mathrm{jaccard\_sim}$ are correlated,
+MGDA-VPO will behave like averaging and land within $\pm 2$ pp of V2.
+This is the \emph{null result}---valuable because it confirms the
+degeneracy hypothesis.
+
+\paragraph{The interesting variant.}
+Add deliberately uncorrelated axes---a brevity penalty and a
+tool-call-format validity check---and see whether MGDA-VPO opens a gap.
+If it does, the contribution is: \emph{VPO with well-designed
+uncorrelated axes outperforms any scalarisation.}
+
+\paragraph{Experimental controls.}
+\begin{itemize}[nosep]
+\item Same environment as Exp9/10 (nodeset3 H100, same bash sandbox).
+\item Same $\mathrm{mbs}=8$, $G=8$, $\mathrm{lr}=10^{-5}$,
+  $\mathrm{lora\_rank}=16$.
+\item Same weight-sync protocol.
+\item $\mathrm{max\_steps} = 200$ with $\mathrm{save\_steps} = 50$ for
+  early-stopping analysis.
+\end{itemize}
+
+% ======================================================================
+\section{Relation to Existing Work}
+\label{sec:related}
+
+\paragraph{Multi-task learning.}
+MGDA was introduced for multi-task learning by Sener \& Koltun (2018),
+who showed it produces Pareto-stationary updates for $K$ task losses.
+Our contribution is applying it to the \emph{advantage decomposition
+within a single RL step}, where each ``task'' is a reward axis from a
+privileged teacher.
+
+\paragraph{Multi-objective RL (MORL).}
+MORL learns a policy that trades off multiple objectives, typically by
+computing a Pareto front over policies.  VPO is different: we do not
+seek a set of Pareto-optimal policies but a \emph{single update
+direction} that improves all axes simultaneously at each step.
+
+\paragraph{Reward shaping / potential-based shaping.}
+Ng et al.\ (1999) showed that potential-based reward shaping does not
+change the optimal policy.  VPO is not reward shaping: it changes the
+\emph{gradient direction}, not the reward value, and therefore can
+change which policy is optimal.
+
+\paragraph{RLHF with process reward models (PRMs).}
+PRMs provide dense per-step rewards but still scalarise them.
+VPO would apply if the PRM had multiple independent heads (e.g.\
+correctness, safety, helpfulness) that were preserved at the gradient
+level rather than collapsed into a single score.
+
+% ======================================================================
+\section{Open Questions}
+\label{sec:open}
+
+\begin{enumerate}
+\item \textbf{Critic architecture.}
+  $K$ separate critics (one per axis) vs.\ one critic with $K$-headed
+  output.  The headed critic shares representation and is cheaper, but
+  may produce correlated advantages---exactly the degeneracy we want to
+  avoid.
+
+\item \textbf{Compute cost.}
+  $K$ backward passes is $3$--$5\times$ the trainer cost at $K{=}3$--$5$.
+  Is there a single-backward variant that approximates MGDA?  Candidates:
+  (a) MGDA-Approx (one backward with mixed advantage, one with
+  worst-axis advantage); (b) Hessian-vector-product--based MGDA that
+  avoids explicit per-axis backward.
+
+\item \textbf{Stability with GRPO.}
+  GRPO's group-mean centring can push $\bm{\alpha}^*$ away from
+  improving directions early in training, when per-axis advantages are
+  noisy.  Does MGDA's ``stop when no improving direction exists''
+  behaviour interact badly with this?
+
+\item \textbf{Adaptive $K$.}
+  Can we learn which axes to track?  Start with $K{=}10$, prune axes
+  whose $\alpha_k^*$ drops below a threshold.  This is an $L_0$
+  regularisation problem on the simplex.
+
+\item \textbf{Generalisation beyond bash.}
+  In math (step-level checks), code (unit-test granularity), or agentic
+  tasks (intermediate state visibility), privileged teachers with
+  structured feedback are more naturally available.  Does VPO generalise
+  and does the axis-independence condition hold in those domains?
+
+\item \textbf{Theoretical analysis.}
+  Under what conditions does MGDA-VPO converge to a policy that
+  Pareto-dominates the scalarised baseline?  Can we bound the
+  improvement as a function of the inter-axis correlation matrix?
+\end{enumerate}
+
+% ======================================================================
+\section{Positioning Relative to the Current Paper}
+\label{sec:positioning}
+
+The three findings of the current paper are complete and do not depend
+on VPO:
+\begin{enumerate}
+\item Variational self-consistency + weight sync = $+15$ pp (Exp9/10).
+\item Scalar self-similarity is a surprisingly strong baseline ($+13$ pp;
+  the variational machinery's incremental contribution is small).
+\item DBPO (density reward) is a documented failure mode (format collapse).
+\end{enumerate}
+
+VPO is naturally a \textbf{follow-up paper} about \emph{how} to design
+the reward axes and \emph{how} to combine them, building on the same
+weight-synced GRPO + bash environment substrate.  The current paper
+establishes the substrate; VPO asks the next question.
+
+% ======================================================================
+\section*{References}
+\addcontentsline{toc}{section}{References}
+
+\begin{itemize}[nosep]
+\item D\'{e}sid\'{e}ri, J.-A. (2012).
+  \emph{Multiple-gradient descent algorithm for multiobjective
+  optimization}.  Comptes Rendus Mathematique, 350(5--6), 313--318.
+\item Sener, O. \& Koltun, V. (2018).
+  \emph{Multi-task learning as multi-objective optimization}.
+  NeurIPS 2018.
+\item Ng, A.~Y., Harada, D. \& Russell, S. (1999).
+  \emph{Policy invariance under reward transformations: Theory and
+  application to reward shaping}.  ICML 1999.
+\item Wang, T. \& Isola, P. (2020).
+  \emph{Understanding contrastive representation learning through
+  alignment and uniformity on the hypersphere}.  ICML 2020.
+\end{itemize}
+
+\end{document}
