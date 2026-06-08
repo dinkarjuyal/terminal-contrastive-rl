@@ -1,0 +1,24 @@
+{
+  "model": "k5",
+  "budget": 8,
+  "num_tasks": 14,
+  "sequential_solve_rate": 0.0,
+  "iid_pass_at_budget": 0.0,
+  "avg_evals_to_solve": NaN,
+  "solved_round": {
+    "wc_words": null,
+    "wc_lines": null,
+    "file_size": null,
+    "list_etc": null,
+    "find_py": null,
+    "find_exec": null,
+    "sort_uniq": null,
+    "head_lines": null,
+    "grep_ip": null,
+    "awk_users": null,
+    "python_version": null,
+    "os_info": null,
+    "pwd_check": null,
+    "env_home": null
+  }
+}

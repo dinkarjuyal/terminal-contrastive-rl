@@ -1,0 +1,24 @@
+{
+  "model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "budget": 8,
+  "num_tasks": 14,
+  "sequential_solve_rate": 0.7142857142857143,
+  "iid_pass_at_budget": 0.7857142857142857,
+  "avg_evals_to_solve": 2.6,
+  "solved_round": {
+    "wc_words": 1,
+    "wc_lines": 1,
+    "file_size": 1,
+    "list_etc": null,
+    "find_py": 6,
+    "find_exec": null,
+    "sort_uniq": 8,
+    "head_lines": 1,
+    "grep_ip": 4,
+    "awk_users": 2,
+    "python_version": 1,
+    "os_info": null,
+    "pwd_check": 1,
+    "env_home": null
+  }
+}

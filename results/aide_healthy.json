@@ -1,0 +1,24 @@
+{
+  "model": "healthy",
+  "budget": 8,
+  "num_tasks": 14,
+  "sequential_solve_rate": 0.7142857142857143,
+  "iid_pass_at_budget": 0.7857142857142857,
+  "avg_evals_to_solve": 1.9,
+  "solved_round": {
+    "wc_words": 1,
+    "wc_lines": 2,
+    "file_size": 1,
+    "list_etc": null,
+    "find_py": null,
+    "find_exec": null,
+    "sort_uniq": 1,
+    "head_lines": 4,
+    "grep_ip": 5,
+    "awk_users": 1,
+    "python_version": 1,
+    "os_info": 2,
+    "pwd_check": 1,
+    "env_home": null
+  }
+}

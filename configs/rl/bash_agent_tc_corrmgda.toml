@@ -1,0 +1,56 @@
+# Bash agent: corrected MRPO — quality-aligned non-collinear axes.
+# Exp19d tests the §8 lesson: drop the HARMFUL non-collinear axis (brevity, which
+# rewarded the short degenerate outputs that collapsed Exp19b) and the REDUNDANT
+# axis (jaccard, ρ=0.95 with strict). Keep consensus (strict) plus two
+# quality-bearing anti-collapse axes: exit_success (requires real execution) and
+# tool_format (requires a well-formed tool call). Question: do quality-aligned
+# axes preserve the base model's best@k diversity where Exp19b destroyed it?
+
+model = "Qwen/Qwen2.5-1.5B-Instruct"
+
+exclude_task_ids = ["find_py", "find_exec", "sort_uniq"]
+
+[env]
+id = "bash_agent"
+
+[inference]
+gpus = 1
+
+[inference.args]
+enforce_eager = true
+
+[trainer]
+gpus = 1
+
+[trainer.args]
+run_name = "bash-agent-tc-corrmgda"
+report_to = "none"
+max_concurrent = 32
+
+use_lora = true
+lora_rank = 16
+learning_rate = 1e-5
+micro_batch_size = 8
+rollouts_per_example = 8
+batch_size = 88
+max_steps = 200
+save_steps = 20
+max_tokens = 512
+max_seq_len = 2048
+
+use_terminal_contrastive = true
+terminal_sim_measure = "strict"
+
+use_vector_tc = true
+reward_vector_dim = 3
+reward_axes = ["strict", "exit", "tool_format"]
+reward_vector_dump_path = "/tmp/corrmgda_rvecs.jsonl"
+dirichlet_alpha = 1.0
+variational_beta = 0.01
+
+vllm_server_port = 8000
+
+nccl_group_port = 51216
+
+use_mgda_vpo = true
+mgda_grad_method = "loop"

@@ -13,6 +13,7 @@ Four measures ranked by expected quality (to be validated via overfit inspection
 """
 
 import difflib
+import json
 import math
 import re
 import string
@@ -283,34 +284,286 @@ def trajectory_diversity(stdouts: list[str], measure: str = "strict") -> float:
     return 1.0 - sum(matrix[i][j] for i, j in pairs) / len(pairs)
 
 
+# ---------------------------------------------------------------------------
+# Deliberately-uncorrelated reward axes (MRPO / Exp19)
+#
+# The K=3 V2 axes (strict_sim, jaccard_sim, exit_success) are near-collinear
+# (strict & jaccard both measure output similarity), which is why V2 ≈ V1.
+# To test the paper's central claim — that vector rewards earn their keep only
+# when the axes carry non-collinear information — we add two axes designed to
+# be low-correlation with correctness:
+#   • brevity      : negative completion length (a correct answer can be terse
+#                    or verbose → low correlation with the similarity axes)
+#   • tool_format  : fraction of the rollout's tool calls that are well-formed
+#                    (a correct answer can still emit malformed tool syntax)
+# These are derived from the assistant *completion*, not the terminal stdout.
+# ---------------------------------------------------------------------------
+
+# Hermes-style tool-call fragment (the parser used by vf-vllm for this env).
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_OPEN_TAG_RE = re.compile(r"<tool_call>")
+
+
+def _assistant_text(completion) -> str:
+    """Concatenate assistant-turn content from a completion (messages list or str)."""
+    if isinstance(completion, str):
+        return completion
+    if isinstance(completion, list):
+        parts: list[str] = []
+        for msg in completion:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") not in (None, "assistant"):
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):  # multimodal content blocks
+                parts.extend(
+                    b.get("text", "") for b in content if isinstance(b, dict)
+                )
+            # structured tool_calls (OpenAI format) — count their args as text
+            for tc in msg.get("tool_calls", []) or []:
+                fn = (tc or {}).get("function", {}) if isinstance(tc, dict) else {}
+                parts.append(str(fn.get("arguments", "")))
+        return "\n".join(parts)
+    return ""
+
+
+def brevity_reward(completions: list) -> list[float]:
+    """
+    Per-rollout brevity in [0, 1]: 1.0 = shortest in group, 0.0 = longest.
+    Normalised within the group so it is scale-free and z-scoreable downstream.
+    """
+    lengths = [float(len(_assistant_text(c))) for c in completions]
+    lo, hi = min(lengths), max(lengths)
+    if hi - lo < 1e-9:
+        return [1.0] * len(lengths)
+    return [1.0 - (l - lo) / (hi - lo) for l in lengths]
+
+
+def tool_format_validity(completions: list) -> list[float]:
+    """
+    Per-rollout fraction of well-formed tool calls in [0, 1].
+
+    A tool call is well-formed if a <tool_call>...</tool_call> block parses as
+    JSON. Penalises open <tool_call> tags that never parse. A rollout with no
+    tool-call attempts at all scores 0.0 (it never used the tool it was asked to).
+    """
+    out: list[float] = []
+    for c in completions:
+        text = _assistant_text(c)
+        attempts = len(_OPEN_TAG_RE.findall(text))
+        if attempts == 0:
+            out.append(0.0)
+            continue
+        valid = 0
+        for blob in _TOOL_CALL_RE.findall(text):
+            try:
+                obj = json.loads(blob)
+                if isinstance(obj, dict) and ("arguments" in obj or "name" in obj):
+                    valid += 1
+            except (ValueError, TypeError):
+                pass
+        out.append(valid / max(attempts, 1))
+    return out
+
+
+# Registry of available axes. Each entry maps a name to a builder that returns
+# a per-rollout list[float] given the group's (stdouts, exit_codes, completions).
+def _axis_strict(stdouts, ec, comps):
+    m = compute_similarity_matrix(stdouts, ec, "strict")
+    n = len(stdouts)
+    return [sum(m[i][j] for j in range(n) if j != i) / max(n - 1, 1) for i in range(n)]
+
+
+def _axis_jaccard(stdouts, ec, comps):
+    m = compute_similarity_matrix(stdouts, exit_codes=None, measure="jaccard")
+    n = len(stdouts)
+    return [sum(m[i][j] for j in range(n) if j != i) / max(n - 1, 1) for i in range(n)]
+
+
+def _axis_exit(stdouts, ec, comps):
+    return [1.0 if e == 0 else 0.0 for e in ec]
+
+
+def _axis_distinct(stdouts, ec, comps):
+    # Coverage objective (idea #1): reward a rollout for DIFFERING from the group
+    # = 1 - mean strict similarity to others. Opposite of consensus. Gated by
+    # quality axes (exit/tool_format) so the policy is pushed toward valid-but-
+    # diverse outputs (what best@k / downstream search needs) rather than agreement.
+    m = compute_similarity_matrix(stdouts, ec, "strict")
+    n = len(stdouts)
+    return [1.0 - (sum(m[i][j] for j in range(n) if j != i) / max(n - 1, 1)) for i in range(n)]
+
+
+REWARD_AXES = {
+    "strict": _axis_strict,
+    "jaccard": _axis_jaccard,
+    "exit": _axis_exit,
+    "distinct": _axis_distinct,
+    "brevity": lambda stdouts, ec, comps: brevity_reward(comps or [""] * len(stdouts)),
+    "tool_format": lambda stdouts, ec, comps: tool_format_validity(
+        comps or [""] * len(stdouts)
+    ),
+}
+
+# Default K=3 set reproduces V2 exactly (backward compatible).
+DEFAULT_AXES = ["strict", "jaccard", "exit"]
+# K=5 non-collinear set for the MRPO flagship (Exp19b).
+MRPO_AXES = ["strict", "jaccard", "exit", "brevity", "tool_format"]
+# Coverage objective (idea #1): quality (exit, tool_format) + distinctness, NO consensus.
+COVERAGE_AXES = ["exit", "tool_format", "distinct"]
+
+
+def _extract_boxed(completion) -> str:
+    """Final boxed answer from a completion (for answer-based tasks like gsm8k/math)."""
+    try:
+        from verifiers.utils.data_utils import extract_boxed_answer
+    except Exception:
+        return ""
+    txt = _assistant_text(completion)
+    try:
+        return (extract_boxed_answer(txt) or "").strip()
+    except Exception:
+        return ""
+
+
+def answer_consensus_vector(completions: list, axes: list[str] | None = None) -> list[list[float]]:
+    """Verifier-free reward axes for answer-based tasks (gsm8k, math), computed
+    from completions' final answers (no ground truth):
+      consensus : fraction of the group sharing this rollout's answer (self-consistency)
+      format    : 1.0 if a boxed answer was produced
+      brevity   : 1.0=shortest in group .. 0.0=longest
+      distinct  : 1 - consensus (coverage objective)
+    Returns (G, len(axes)). Default axes = [consensus, format, brevity].
+    """
+    names = axes or ANSWER_AXES
+    n = len(completions)
+    ans = [_extract_boxed(c) for c in completions]
+    consensus = []
+    for i in range(n):
+        others = [j for j in range(n) if j != i]
+        same = sum(1 for j in others if ans[j] != "" and ans[j] == ans[i])
+        consensus.append(same / max(len(others), 1))
+    cols = {
+        "consensus": consensus,
+        "format": [1.0 if a != "" else 0.0 for a in ans],
+        "brevity": brevity_reward(completions),
+        "distinct": [1.0 - c for c in consensus],
+    }
+    return [[cols[ax][i] for ax in names] for i in range(n)]
+
+
+ANSWER_AXES = ["consensus", "format", "brevity"]
+# Coverage variant for answer tasks: reward distinctness + format, not agreement.
+ANSWER_COVERAGE_AXES = ["format", "brevity", "distinct"]
+
+
 def compute_reward_vector(
     stdouts: list[str],
     exit_codes: list[int] | None = None,
+    completions: list | None = None,
+    axes: list[str] | None = None,
 ) -> list[list[float]]:
     """
-    Compute K=3 reward dimensions per rollout (returns shape (G, 3)):
-      dim 0: mean strict similarity to others  — numerical/content consensus
-      dim 1: mean token-jaccard to others      — approach/structural similarity
-      dim 2: exit-code success                 — 1.0 if exit_code==0 else 0.0
+    Compute K reward dimensions per rollout (returns shape (G, K)).
 
-    Used for vector lambda sampling (V2): R_i = λ · reward_vector[i],
+    Default axes reproduce V2 exactly: [strict_sim, jaccard_sim, exit_success].
+    Pass axes=MRPO_AXES (and completions) for the K=5 non-collinear set used by
+    the MRPO flagship experiment.
+
+    Used for vector lambda sampling (V2/MRPO): R_i = λ · reward_vector[i],
     λ ~ Dirichlet(α) sampled fresh each training step.
     """
     n = len(stdouts)
     ec = exit_codes or [0] * n
+    names = axes or DEFAULT_AXES
 
-    strict_mat = compute_similarity_matrix(stdouts, exit_codes, "strict")
-    jaccard_mat = compute_similarity_matrix(stdouts, exit_codes=None, measure="jaccard")
-    exit_success = [1.0 if e == 0 else 0.0 for e in ec]
+    columns = [REWARD_AXES[name](stdouts, ec, completions) for name in names]
+    # transpose columns (K x G) -> rows (G x K)
+    return [[columns[k][i] for k in range(len(names))] for i in range(n)]
 
-    result = []
-    for i in range(n):
-        others = [j for j in range(n) if j != i]
-        r0 = sum(strict_mat[i][j] for j in others) / max(len(others), 1)
-        r1 = sum(jaccard_mat[i][j] for j in others) / max(len(others), 1)
-        r2 = exit_success[i]
-        result.append([r0, r1, r2])
-    return result
+
+def reward_axis_correlation(
+    reward_vectors: list[list[float]],
+) -> dict:
+    """
+    §7 diagnostic: given a stack of per-rollout reward vectors (M x K, pooled
+    across many groups), return the K×K Pearson correlation matrix, the mean
+    off-diagonal |rho|, and the effective rank (exp of the entropy of the
+    normalised eigenvalue spectrum of the correlation matrix).
+
+    Pure-Python (no numpy dependency) so it can run anywhere the trainer runs.
+    """
+    m = len(reward_vectors)
+    if m < 2:
+        return {"n": m, "corr": [], "mean_abs_offdiag": 0.0, "eff_rank": 0.0}
+    K = len(reward_vectors[0])
+    cols = [[reward_vectors[i][k] for i in range(m)] for k in range(K)]
+
+    def _mean(x):
+        return sum(x) / len(x)
+
+    def _std(x, mu):
+        return (sum((v - mu) ** 2 for v in x) / len(x)) ** 0.5
+
+    mus = [_mean(c) for c in cols]
+    sds = [_std(c, mus[k]) or 1e-12 for k, c in enumerate(cols)]
+    corr = [[0.0] * K for _ in range(K)]
+    for a in range(K):
+        for b in range(K):
+            cov = sum(
+                (cols[a][i] - mus[a]) * (cols[b][i] - mus[b]) for i in range(m)
+            ) / m
+            corr[a][b] = cov / (sds[a] * sds[b])
+
+    off = [abs(corr[a][b]) for a in range(K) for b in range(K) if a != b]
+    mean_abs_off = sum(off) / len(off) if off else 0.0
+
+    # effective rank via eigenvalues of the correlation matrix (power-free:
+    # use the fact that trace = K and approximate spectrum by Gershgorin-free
+    # Jacobi eigenvalues for small K).
+    eff_rank = _effective_rank(corr)
+    return {
+        "n": m,
+        "K": K,
+        "corr": corr,
+        "mean_abs_offdiag": mean_abs_off,
+        "eff_rank": eff_rank,
+    }
+
+
+def _effective_rank(corr: list[list[float]]) -> float:
+    """Effective rank = exp(Shannon entropy of normalised eigenvalues)."""
+    K = len(corr)
+    # Jacobi eigenvalue iteration for a small symmetric matrix.
+    a = [row[:] for row in corr]
+    for _ in range(100):
+        # find largest off-diagonal
+        p, q, mx = 0, 1, 0.0
+        for i in range(K):
+            for j in range(i + 1, K):
+                if abs(a[i][j]) > mx:
+                    mx, p, q = abs(a[i][j]), i, j
+        if mx < 1e-9:
+            break
+        app, aqq, apq = a[p][p], a[q][q], a[p][q]
+        phi = 0.5 * math.atan2(2 * apq, aqq - app) if abs(aqq - app) > 1e-12 else math.pi / 4
+        c, s = math.cos(phi), math.sin(phi)
+        for k in range(K):
+            akp, akq = a[k][p], a[k][q]
+            a[k][p] = c * akp - s * akq
+            a[k][q] = s * akp + c * akq
+        for k in range(K):
+            akp, akq = a[p][k], a[q][k]
+            a[p][k] = c * akp - s * akq
+            a[q][k] = s * akp + c * akq
+    eig = [max(a[i][i], 0.0) for i in range(K)]
+    tot = sum(eig) or 1e-12
+    probs = [e / tot for e in eig if e > 1e-12]
+    entropy = -sum(p * math.log(p) for p in probs)
+    return math.exp(entropy)
 
 
 def mean_sim_per_rollout(

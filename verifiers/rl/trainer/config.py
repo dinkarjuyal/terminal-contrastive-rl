@@ -174,11 +174,36 @@ class RLConfig(TrainingArguments):
     )
     reward_vector_dim: int = field(
         default=3,
-        metadata={"help": "K: number of reward dimensions (strict_sim, jaccard, exit_success)."},
+        metadata={"help": "K: number of reward dimensions. Must equal len(reward_axes) when set."},
+    )
+    reward_axes: list[str] | None = field(
+        default=None,
+        metadata={"help": "MRPO: explicit reward-axis names. None -> V2 default [strict, jaccard, exit]. "
+                          "K=5 set: [strict, jaccard, exit, brevity, tool_format]."},
+    )
+    reward_vector_dump_path: str | None = field(
+        default=None,
+        metadata={"help": "If set, append per-group reward vectors to this JSONL for §7 correlation analysis."},
+    )
+    reward_source: str = field(
+        default="terminal",
+        metadata={"help": "Where verifier-free reward axes come from: 'terminal' (bash stdout) "
+                          "or 'answer' (final boxed answer consensus, for gsm8k/math)."},
     )
     dirichlet_alpha: float = field(
         default=1.0,
         metadata={"help": "Dirichlet concentration parameter α for λ sampling."},
+    )
+    use_mgda_vpo: bool = field(
+        default=False,
+        metadata={"help": "MGDA-VPO (§3/§5): solve min-norm simplex QP over the N×N Gram of "
+                          "per-trajectory gradients (cost independent of K), feed β=A^Tα* as the "
+                          "advantage to the single backward. Requires use_vector_tc + reward_vectors."},
+    )
+    mgda_grad_method: str = field(
+        default="loop",
+        metadata={"help": "How to get per-trajectory gradients for MGDA: 'loop' (autograd, robust) "
+                          "or 'vmap' (torch.func per-sample grads, experimental, ~1 pass)."},
     )
 
     # Density-Bootstrap Policy Optimization (DBPO, §4c in research plan):

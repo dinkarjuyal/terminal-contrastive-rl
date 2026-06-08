@@ -126,6 +126,9 @@ class RLTrainer(Trainer):
                 use_density_tc=getattr(args, "use_density_tc", False),
                 density_bandwidth=getattr(args, "density_bandwidth", 0.2),
                 use_scalar_self_sim_grpo=getattr(args, "use_scalar_self_sim_grpo", False),
+                reward_axes=getattr(args, "reward_axes", None),
+                reward_vector_dump_path=getattr(args, "reward_vector_dump_path", None),
+                reward_source=getattr(args, "reward_source", "terminal"),
             )
             self.generator.start()
             self.generator.submit_batch(0)
@@ -292,6 +295,81 @@ class RLTrainer(Trainer):
         self.maybe_clear_cache()
         return total_loss
 
+    def _mgda_beta_advantage(self, model, importance_ratio, keep_mask, reward_vectors):
+        """Coefficient-space MGDA (paper §3). Returns (beta, alpha):
+          • beta  — per-trajectory advantage (N,), to feed the single GRPO backward;
+          • alpha — the simplex mixing weights over the K axes (for logging).
+
+        Cost is independent of K: we form the N per-trajectory score gradients
+        v_i = ∇_θ L_i (L_i = Σ_t keep·(−importance_ratio) for rollout i), build the
+        N×N Gram M_ij=⟨v_i,v_j⟩ once, and solve min_{α∈Δ} (A^Tα)^T M (A^Tα) with
+        Q=A M A^T (A = per-axis z-scored advantages, K×N). No per-axis backprop.
+
+        Two ways to get the per-trajectory gradients:
+          • "vmap" — torch.func per-sample grads over the LoRA params in ~one
+             vectorised pass (also independent of N); the asymptotically cheapest
+             route, but sensitive to the model wrapper. EXPERIMENTAL.
+          • "loop" — torch.autograd.grad per trajectory, sharing one forward
+             (N graph traversals, retain_graph). Robust default.
+        """
+        from verifiers.rl.trainer.mgda import mgda_beta
+
+        rv = reward_vectors.float()            # (N, K)
+        N, K = rv.shape
+        mu = rv.mean(dim=0, keepdim=True)
+        sd = rv.std(dim=0, keepdim=True).clamp(min=1e-3)
+        A = ((rv - mu) / sd).t()               # (K, N) per-axis z-scored advantages
+
+        # per-trajectory differentiable surrogate L_i (gradient = the GRPO score grad)
+        per_tok = (-importance_ratio) * keep_mask.to(importance_ratio.dtype)  # (N, T)
+        L = per_tok.sum(dim=1)                 # (N,)
+        params = [p for p in model.parameters() if p.requires_grad]
+
+        method = getattr(self.args, "mgda_grad_method", "loop")
+        if method == "vmap":
+            M = self._per_traj_gram_vmap(model, L, params)
+        else:
+            grads = []
+            for i in range(N):
+                gi = torch.autograd.grad(L[i], params, retain_graph=True, allow_unused=True)
+                flat = torch.cat([
+                    g.reshape(-1) for g in gi if g is not None
+                ]) if any(g is not None for g in gi) else torch.zeros(1, device=L.device)
+                grads.append(flat)
+            Vmat = torch.stack(grads, dim=0)   # (N, d_lora)
+            M = (Vmat @ Vmat.t())              # (N, N) Gram
+
+        A_list = A.detach().cpu().tolist()
+        M_list = M.detach().cpu().tolist()
+        alpha, beta = mgda_beta(A_list, M_list)
+        beta_t = torch.tensor(beta, device=importance_ratio.device, dtype=importance_ratio.dtype)
+        return beta_t, alpha
+
+    def _per_traj_gram_vmap(self, model, L, params):
+        """EXPERIMENTAL: per-trajectory Gram via torch.func per-sample grads.
+        Falls back to the autograd loop if torch.func is unavailable or the model
+        is not vmap-compatible. Returns the N×N Gram matrix."""
+        try:
+            from torch.func import grad as func_grad, vmap  # noqa: F401
+        except Exception:
+            grads = [torch.autograd.grad(L[i], params, retain_graph=True, allow_unused=True)
+                     for i in range(L.shape[0])]
+            Vmat = torch.stack([
+                torch.cat([g.reshape(-1) for g in gi if g is not None]) for gi in grads
+            ], dim=0)
+            return Vmat @ Vmat.t()
+        # NOTE: a true single-pass vmap implementation requires functionalising the
+        # forward (functional_call over `params`) to recompute L per sample inside
+        # the transform. Wiring that through the PEFT/accelerate stack is left for
+        # on-GPU validation; until then we use the robust per-trajectory loop, which
+        # already makes the cost independent of the axis count K.
+        grads = [torch.autograd.grad(L[i], params, retain_graph=True, allow_unused=True)
+                 for i in range(L.shape[0])]
+        Vmat = torch.stack([
+            torch.cat([g.reshape(-1) for g in gi if g is not None]) for gi in grads
+        ], dim=0)
+        return Vmat @ Vmat.t()
+
     def compute_loss(
         self,
         model: nn.Module,
@@ -325,6 +403,20 @@ class RLTrainer(Trainer):
         is_masked_high = importance_ratio > self.mask_ratio_high
         is_masked = is_masked_low | is_masked_high
         keep_mask = ~is_masked & loss_mask
+
+        # MGDA-VPO (paper §3/§5): preserve the reward vector at the gradient level
+        # WITHOUT K backward passes. All K axis-gradients live in span{v_i} of the
+        # N per-trajectory score gradients, so we compute the N×N Gram matrix once,
+        # solve the simplex min-norm QP (cost independent of K), and feed the
+        # resulting per-trajectory weights β as the advantage — the existing single
+        # backward below then applies exactly Σ_i β_i v_i = Σ_k α*_k g_k.
+        mgda_alpha = None
+        if getattr(self.args, "use_mgda_vpo", False) and reward_vectors is not None:
+            beta, mgda_alpha = self._mgda_beta_advantage(
+                model, importance_ratio, keep_mask, reward_vectors
+            )
+            advantages = beta.unsqueeze(1).expand(-1, advantages.shape[1]).contiguous()
+
         grpo_loss = (-importance_ratio * advantages)[keep_mask].sum()
 
         # Advantage-based contrastive loss (existing)
