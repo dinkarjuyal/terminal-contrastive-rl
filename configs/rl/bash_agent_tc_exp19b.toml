@@ -1,0 +1,57 @@
+# Bash agent: MRPO flagship (K=5 non-collinear axes) + Dirichlet λ + weight sync
+# Experiment 19b: extends V2 (Exp10) from K=3 near-collinear axes to the K=5
+# MRPO set [strict, jaccard, exit, brevity, tool_format]. brevity & tool_format
+# are designed to be low-correlation with the similarity axes, so the vector
+# reward carries genuinely non-collinear information (paper §6/§7).
+#
+# Comparison (same pod, same seed):
+#   Exp10:  vector λ V2, K=3 (strict, jaccard, exit)  -> +16.1 pp  (near-collinear)
+#   Exp19b: vector λ MRPO, K=5 (+brevity, +tool_format) -> (this)
+#
+# The dumped reward vectors feed scripts/analyze_reward_correlation.py (the §7 gate).
+
+model = "Qwen/Qwen2.5-1.5B-Instruct"
+
+exclude_task_ids = ["find_py", "find_exec", "sort_uniq"]
+
+[env]
+id = "bash_agent"
+
+[inference]
+gpus = 1
+
+[inference.args]
+enforce_eager = true
+
+[trainer]
+gpus = 1
+
+[trainer.args]
+run_name = "bash-agent-tc-exp19b"
+report_to = "none"
+max_concurrent = 32
+
+use_lora = true
+lora_rank = 16
+learning_rate = 1e-5
+micro_batch_size = 8
+rollouts_per_example = 8
+batch_size = 88
+max_steps = 200
+save_steps = 20
+max_tokens = 512
+max_seq_len = 2048
+
+use_terminal_contrastive = true
+terminal_sim_measure = "strict"
+
+use_vector_tc = true
+reward_vector_dim = 5
+reward_axes = ["strict", "jaccard", "exit", "brevity", "tool_format"]
+reward_vector_dump_path = "/tmp/exp19b_rvecs.jsonl"
+dirichlet_alpha = 1.0
+variational_beta = 0.01
+
+vllm_server_port = 8000
+
+nccl_group_port = 51216

@@ -22,10 +22,12 @@
 \newcommand{\argmin}{\operatorname*{arg\,min}}
 \newcommand{\argmax}{\operatorname*{arg\,max}}
 \DeclareMathOperator*{\diag}{diag}
+\newcommand{\bestk}{\textrm{best}@k}
 
 % ── Title ─────────────────────────────────────────────────────────────
-\title{Vector Policy Optimization:\\Learning from Structured Privileged Feedback\\[6pt]
-{\large Draft --- For Internal Discussion}}
+\title{Matryoshka Reward Policy Optimization:\\
+Structuring Reward So Diversity Survives for Test-Time Search\\[6pt]
+{\large Draft --- targeting an oral submission}}
 \author{Terminal Contrastive RL Project}
 \date{June 2026}
 
@@ -33,31 +35,66 @@
 \maketitle
 
 \begin{abstract}
-Standard reinforcement learning from human feedback (RLHF) collapses all
-feedback into a single scalar reward.  When a \emph{privileged teacher}
-can provide structured, multi-axis feedback---answer correctness,
-reasoning consistency, tool-call validity, brevity---scalarisation
-discards precisely the information the teacher was introduced to inject.
-We propose \textbf{Vector Policy Optimization (VPO)}, a family of
-update rules that preserve the vectoriality of the reward signal at the
-gradient level.  We present a spectrum from fixed-weight scalarisation
-through Dirichlet random mixing (already validated in our Vector-$\lambda$
-V2 experiments, $+16.1$ pp over base) to \textbf{MGDA-VPO}, which
-computes per-axis policy gradients and combines them via a convex
-optimisation on the simplex that guarantees Pareto-stationary updates.
-We sketch a concrete experiment (Exp19), analyse when VPO earns its keep
-vs.\ degenerating to averaging, and identify open questions around critic
-architecture, compute cost, and stability.
+LLM post-training increasingly feeds an inference-time search that draws many
+candidates and keeps the best.  In this regime the search does the exploiting,
+so training should preserve the diversity that search consumes---yet scalar
+reinforcement learning sharpens the policy onto a single reward mode and
+destroys it.  We argue that reward post-training is better understood as
+\emph{shaping} a policy's diversity for downstream search than as maximising a
+scalar, and we study how the \emph{structure} of the reward signal governs that
+diversity.  We show that under outcome-level policy gradients a vector-valued
+reward can be preserved at the gradient level essentially for free: every
+per-axis gradient lies in the low-dimensional span of a group's per-trajectory
+gradients, so combining axes---including by min-norm (MGDA) methods---is a cheap
+reweighting rather than extra backward passes.  Building on this we propose
+\textbf{Matryoshka Reward Decomposition}, which learns a reward code with a few
+interpretable, quality-aligned dimensions and a deliberately entangled
+remainder, supplying downstream search with controllable rather than undirected
+diversity.
+
+Empirically, across an agentic tool-use task and standard benchmarks (GSM8K,
+MBPP code generation, Wordle), optimising for inter-sample agreement collapses
+tool use and search coverage, and we identify the governing condition: reward
+axes must be both non-collinear \emph{and} aligned with task
+quality---non-collinearity alone is not enough.  We further find that min-norm
+(MGDA) gradient combination is substantially more \emph{reliable} across random
+seeds than fixed or random scalarisation while matching its mean, and that it
+avoids the consensus collapse the other combiners suffer---except in a
+degenerate floor regime (Wordle), which sharpens rather than contradicts the
+condition.  The takeaway: reliability, not mean reward, is the axis on which
+gradient-level vector methods earn their keep, and the benefit tracks reward-axis
+structure as predicted.  The reliability advantage holds from 1.5B to 7B---the
+verifier-free baselines collapse harder at scale while MGDA preserves base
+performance---so it is not a small-model artifact.
 \end{abstract}
 
 \tableofcontents
 \newpage
 
 % ======================================================================
-\section{Motivation: Why Scalar Rewards Waste Privileged Information}
+\section{Motivation: Search Wants Diversity; Scalar Rewards Destroy It}
 \label{sec:motivation}
 
-The standard policy gradient maximises expected advantage:
+\subsection{The exploration/exploitation split has moved}
+
+LLMs are increasingly deployed \emph{inside} an inference-time search loop:
+sample $k$ candidates and keep the best under some selector (a verifier, a
+reward model, a unit test, or an evolutionary outer loop).  In this regime
+the search does the exploiting.  What training must supply is
+\emph{coverage}: a policy whose samples spread across enough distinct,
+high-quality strategies that the selector has something to select from.
+
+This regime is not hypothetical.  Code-engineering agents such as AIDE
+(Jiang et al.\ 2025) hill-climb a metric by tree-searching the space of
+candidate solutions---draft, run, read the feedback, propose the next
+edit---and beat the best \emph{linear} (single-pass) agent by roughly
+$4\times$ on MLE-bench.  The lesson transfers directly: the search is the
+exploiter, and its bottleneck is the proposer's ability to keep generating
+\emph{distinct, useful} candidates as the budget is spent.  A policy that has
+been sharpened onto one mode starves that search.  Our experiments
+(Section~\ref{sec:exp}) measure this bottleneck directly.
+
+Standard policy-gradient post-training optimises a fixed scalar reward:
 \begin{equation}
   \nabla J(\theta) \;=\; \E_{\tau \sim \pi_\theta}\!\Big[
     \nabla \log \pi_\theta(\tau) \;\cdot\; A(\tau)
@@ -65,16 +102,25 @@ The standard policy gradient maximises expected advantage:
   \qquad A(\tau) \in \R.
   \label{eq:pg-scalar}
 \end{equation}
-The advantage $A(\tau)$ is a single number.  When a privileged teacher
-returns a vector of feedback signals $\bm{R}(\tau) \in \R^K$, the
-conventional pipeline reduces it to a scalar via a fixed or random
-weighted sum \emph{before} computing the gradient.  This is informationally
-lossy: a trajectory that is right on $K{-}1$ axes but wrong on one gets
-the same scalar as a trajectory that is mediocre on all axes.
+Maximising a scalar sharpens the distribution onto whichever single
+strategy tops that scalar.  The entropy drops, every extra sample becomes a
+near-duplicate, and the diversity that downstream search runs on collapses
+precisely when it is most valuable.  This is the failure mode our
+experiments and others' (Section~\ref{sec:related}) repeatedly hit: $\bestk$
+stops improving with $k$ because the $k$ draws are no longer distinct.
+
+\subsection{Scalarising a privileged teacher throws away structure}
+
+The same scalar bottleneck has a second cost.  When a \emph{privileged
+teacher} returns a vector of feedback signals $\bm{R}(\tau) \in \R^K$, the
+conventional pipeline reduces it to a scalar via a fixed or random weighted
+sum \emph{before} computing the gradient.  This is informationally lossy: a
+trajectory that is right on $K{-}1$ axes but wrong on one gets the same
+scalar as a trajectory that is mediocre on all axes.
 
 \paragraph{Example.}
-Consider a bash agent rollout that produces the correct answer but uses
-an invalid tool-call format.  A 5-axis teacher returns
+Consider a bash-agent rollout that produces the correct answer but uses an
+invalid tool-call format.  A 5-axis teacher returns
 \[
   \bm{A}(\tau) = (\underbrace{+1}_{\text{correct}},\;
                    \underbrace{+1}_{\text{reasoning}},\;
@@ -83,22 +129,52 @@ an invalid tool-call format.  A 5-axis teacher returns
                    \underbrace{-0.5}_{\text{verbose}}).
 \]
 Scalarising with equal weights gives $A = +0.3$---``this trajectory was
-$0.3$ good.''  The gradient says ``do more of this, a bit,'' and the
-model slowly drifts.  A vector update can say: ``fix the tool call; the
-rest is fine.''  That targeted signal is exactly what pedagogical RL is
-for, and scalarisation destroys it.
+$0.3$ good.''  The gradient says ``do more of this, a bit,'' and the model
+drifts.  A vector-aware update can instead say ``fix the tool call; the rest
+is fine,'' \emph{and} can route the correct-but-verbose and
+correct-but-different-state variants into distinct regions of policy space
+so search later sees both.  That targeted, diversity-preserving signal is
+what pedagogical RL is for, and scalarisation destroys it.
 
-\paragraph{The exploration problem.}
-On-policy RL already struggles when the policy rarely samples correct
-trajectories: the gradient has no positive examples to learn from.
-Pedagogical RL addresses this by injecting trajectories or rewards the
-policy could not produce itself.  Scalarising the teacher's feedback
-partially negates this injection: we brought in structured information
-and then threw away the structure.
+\subsection{One thesis}
+
+These are the same problem viewed from two sides.  Scalarisation collapses
+the policy (bad for search) \emph{and} collapses the teacher's structure
+(bad for credit assignment).  Our claim is that the right object to
+optimise is not a scalar reward but a \emph{structured reward code}, and
+that the value of doing so is governed by a single, measurable quantity:
+how much non-collinear information that code actually carries.  The rest of
+the paper makes ``structured reward code'' precise (Section~\ref{sec:mrd}),
+shows the optimisation is cheap (Section~\ref{sec:subspace}), and turns the
+caveat into a predictive law (Section~\ref{sec:when}).
 
 % ======================================================================
 \section{Background: What We Already Know Works}
 \label{sec:background}
+
+\subsection{Task and setup}
+\label{sec:task}
+All experiments use one agentic environment: a suite of $20$ command-line (bash)
+tasks in which the model must accomplish a stated goal by issuing shell commands
+through a tool interface and reading their output---e.g.\ counting the lines in a
+file, or listing files matching a pattern.  Each task has a ground-truth answer
+used \emph{only} for evaluation.  The policy is Qwen2.5-1.5B-Instruct trained
+with GRPO and online weight-synced generation; ``base'' denotes the untrained
+model.  Training is \emph{verifier-free}: instead of ground truth, the reward
+scores a rollout by how similar its terminal output is to the other rollouts in
+its group (self-consistency/consensus), optionally as a vector of such axes
+(Section~\ref{sec:spectrum}).  We evaluate with best@$k$ (the unbiased pass@$k$
+estimator) against the held-out answers, because it measures the coverage a
+downstream search would exploit.
+
+\emph{Scope.}  We treat the structural result (Section~\ref{sec:subspace}) as
+analytical and model-agnostic, and corroborate the empirical findings beyond the
+originating bash task: the consensus collapse and the min-norm reliability /
+collapse-avoidance advantage replicate on GSM8K and MBPP and at 7B
+(Sections~\ref{sec:exp-crosstask}--\ref{sec:limitations}), with Wordle a
+degenerate-axis counter-case that sharpens the governing condition.  A full
+scale$\times$task grid and the learned reward-decomposition code remain open
+items (Section~\ref{sec:limitations}).
 
 \subsection{Scalar self-similarity (Exp17)}
 
@@ -110,6 +186,7 @@ $G{=}8$, compute mean pairwise terminal similarity
 \]
 then z-score over the group and use as the GRPO advantage.
 Result: $+12.5$ pp over base on Prime A6000 ($+13.4$ pp at step 150).
+A surprisingly strong scalar baseline---any vector method must clear it.
 
 \subsection{Variational V1 (Exp9)}
 
@@ -133,157 +210,349 @@ and collapse:
   \label{eq:v2-dirichlet}
 \end{equation}
 Result: $+16.1$ pp over base---the best single number, but only $\sim$1 pp
-above V1.  The small gap is consistent with the axes being highly
-correlated (both $\mathrm{strict\_sim}$ and $\mathrm{jaccard\_sim}$ measure
-output similarity).
+above V1.
+
+\paragraph{Reading the V2 result correctly.}
+The small gap is not a disappointment to be explained away; it is the first
+data point of this paper's central law.  Two of the three axes
+($\mathrm{strict\_sim}$ and $\mathrm{jaccard\_sim}$) both measure output
+similarity and are nearly collinear, so the ``vector'' reward is effectively
+rank-$\approx$2 and the Dirichlet mixing has almost nothing orthogonal to
+mix.  V2 beating V1 by $\sim$1 pp is exactly what
+Section~\ref{sec:when} predicts for a near-collinear code.  The lesson that
+organises the rest of the paper: \emph{the axes were not designed to carry
+independent information, so they did not.}
 
 % ======================================================================
-\section{Spectrum of Vector-Reward Update Rules}
+\section{The Gradient-Subspace View: Vector Rewards Are Almost Free}
+\label{sec:subspace}
+
+Before discussing \emph{which} update rule to use, we establish a structural
+fact that reshapes the cost analysis and gives a cleaner formulation of every
+rule in the spectrum.
+
+\subsection{All per-axis gradients live in a $G$-dimensional subspace}
+
+Under GRPO-style outcome advantages, the advantage is assigned at the
+trajectory level and broadcast to tokens.  For reward axis $k$ the
+group-estimated policy gradient is
+\begin{equation}
+  \bm{g}_k
+  \;=\; \frac{1}{G}\sum_{i=1}^{G} A_k(\tau_i)\,
+        \underbrace{\nabla_\theta \log \pi_\theta(\tau_i)}_{\textstyle v_i}.
+  \label{eq:gk}
+\end{equation}
+The per-trajectory score gradient $v_i$ is \emph{identical across all
+axes}---only the scalar weight $A_k(\tau_i)$ changes.  Hence
+\begin{equation}
+  \bm{g}_k \in \mathrm{span}\{v_1,\dots,v_G\}
+  \quad\text{for every } k,
+  \qquad
+  \dim \mathrm{span}\{v_i\} \le G .
+  \label{eq:span}
+\end{equation}
+With $G=8$ rollouts, \emph{all} $K$ axis-gradients---and every convex
+combination of them---live in a subspace of dimension at most $8$,
+regardless of $K$ or of the size of $\theta$.
+
+\paragraph{Consequence 1: no $K$ backward passes.}
+We never need one backward pass per axis.  We need the $G$ per-trajectory
+gradients $\{v_i\}$ (which the trainer already forms, modulo storing them
+per-sample), after which \emph{any} scalarisation is a reweighting of the
+same $G$ vectors.  The ``$3$--$5\times$ trainer cost'' that earlier framing
+worried about is an artifact of materialising $\bm g_k$ explicitly rather
+than working in coefficient space.
+
+\paragraph{Consequence 2: a tiny Gram-matrix problem.}
+Let $V = [v_1,\dots,v_G]$ and let $A \in \R^{K\times G}$ be the advantage
+matrix with $A_{ki}=A_k(\tau_i)$, so $\bm g_k = \tfrac1G V (A^\top)_{:,k}$.
+Any mixture $\sum_k \alpha_k \bm g_k = \tfrac1G V A^\top \bm\alpha$ has squared
+norm
+\begin{equation}
+  \Big\|\textstyle\sum_k \alpha_k \bm g_k\Big\|^2
+  = \tfrac1{G^2}\,(A^\top\bm\alpha)^\top\, M\, (A^\top\bm\alpha),
+  \qquad
+  M_{ij} = \langle v_i, v_j\rangle,
+  \label{eq:gram}
+\end{equation}
+where $M\in\R^{G\times G}$ is the (cheap) Gram matrix of per-trajectory
+gradients.  Every update rule below---fixed, Dirichlet, worst-axis, MGDA---is
+an optimisation over $\bm\alpha$ in this $G$-dimensional quadratic, with no
+further access to $\theta$-sized objects.
+
+\paragraph{Consequence 3: free exploration of the scalarisation simplex.}
+Because the entire family of reward mixtures is reachable from the same
+$\{v_i\}$, we can train \emph{across} a distribution of scalarisations at no
+extra backward cost---sampling many $\bm\alpha$ per step and steering the
+policy to cover the strategies each one favours.  This is the concrete lever
+by which structured reward \emph{spreads} the policy for downstream search
+(Section~\ref{sec:motivation}), rather than collapsing it.
+
+\paragraph{Scope.}
+Equation~\eqref{eq:span} relies on outcome-level (trajectory-broadcast)
+advantages, as in GRPO.  Token-level GAE assigns a different advantage per
+token and breaks the rank-$G$ argument; the subspace then has dimension up to
+(group size $\times$ tokens) and the cheap-Gram story no longer holds.  We
+restrict claims to the outcome-advantage setting, which is the one our
+experiments use.
+
+% ======================================================================
+\section{Spectrum of Vector-Reward Update Rules (in Coefficient Space)}
 \label{sec:spectrum}
 
-Given a vector advantage $\bm{A}(\tau) \in \R^K$, the design question is:
-\emph{how do we turn it into a parameter update?}
+Given a vector advantage $\bm{A}(\tau) \in \R^K$, the design question is how
+to turn it into a parameter update.  By Section~\ref{sec:subspace} every
+choice is a rule for picking $\bm\alpha$ in Eq.~\eqref{eq:gram}.
 
 \begin{table}[h]
 \centering
-\caption{Spectrum of vector-reward update rules.}
+\caption{Spectrum of vector-reward update rules, recast as choices of the
+mixing coefficients $\bm\alpha$ over the $G$-dimensional trajectory-gradient
+subspace.}
 \label{tab:spectrum}
 \begin{tabular}{@{}lll@{}}
 \toprule
-\textbf{Approach} & \textbf{Update rule} & \textbf{When it earns its keep} \\
+\textbf{Approach} & \textbf{Rule for $\bm\alpha$ / scalarisation} & \textbf{When it earns its keep} \\
 \midrule
 Fixed linear weight &
   $A_{\mathrm{scalar}} = \bm{w} \cdot \bm{A}$ &
   Baseline only; requires hand-tuning \\[4pt]
-\textbf{Dirichlet mixing (V2)} &
+Dirichlet mixing (V2) &
   $\bm{\lambda} \sim \mathrm{Dir}(\alpha)$ per step &
   Random regularisation across axes \\[4pt]
 Worst-axis (max-min) &
   $A_{\mathrm{scalar}} = \min_k A_k$ &
-  Guarantees improvement on every axis; slow \\[4pt]
-\textbf{MGDA} (D\'{e}sid\'{e}ri 2012) &
+  Improves the weakest axis; slow \\[4pt]
+MGDA (D\'{e}sid\'{e}ri 2012) &
   $\argmin_{\bm{\alpha} \in \Delta^{K-1}} \|\sum_k \alpha_k \bm{g}_k\|^2$ &
-  Pareto-stationary; auto-weights complementary axes \\[4pt]
+  Min-norm compromise; see caveats \S\ref{sec:mgda} \\[4pt]
 Adaptive per-axis &
   Weight axis $k$ $\propto$ policy weakness on $k$ &
   Spends gradient where needed; needs per-axis eval \\[4pt]
-Multi-head policy &
-  $K$ heads, each maximises own $A_k$; mix at inference &
-  Each axis gets clean signal; mixing rule open \\
+\textbf{Matryoshka (MRD, ours)} &
+  $\bm\lambda \sim \mathrm{Dir}$ with a \emph{nesting prior} over a learned
+  sparse code &
+  Manufactures the non-collinear axes the others assume \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\paragraph{Key distinction.}
-Approaches 1--3 collapse the vector to a scalar \emph{before} the
-gradient; only MGDA and multi-head preserve vectoriality \emph{at the
-gradient level}.  This is the crucial difference: if you scalarise
-before the backward pass, the gradient has no way to ``unmix'' the
-information.
+\paragraph{The crucial distinction, restated.}
+Rows~1--3 collapse the vector to a scalar before forming any gradient; MGDA
+and MRD operate on the per-axis structure.  But note that, by
+Eq.~\eqref{eq:gram}, ``preserving vectoriality at the gradient level'' does
+\emph{not} buy a richer subspace---every rule lives in the same
+$\mathrm{span}\{v_i\}$.  What it buys is a different \emph{choice within that
+subspace}.  The value of that choice is bounded by how much the rows of $A$
+actually differ, which is the quantity Section~\ref{sec:when} makes
+predictive and Section~\ref{sec:mrd} makes designable.
 
 % ======================================================================
-\section{MGDA-VPO: Algorithm}
-\label{sec:mgda-vpo}
+\section{MGDA as One Instantiation}
+\label{sec:mgda}
 
-MGDA (Multiple Gradient Descent Algorithm; D\'{e}sid\'{e}ri 2012)
-computes per-objective gradients and finds a convex combination that
-decreases all objectives simultaneously.  Applied to RL with $K$
-advantage axes:
+MGDA (Multiple-Gradient Descent Algorithm; D\'{e}sid\'{e}ri 2012) picks the
+min-norm convex combination of the per-axis gradients.  Via
+Eq.~\eqref{eq:gram} this is a $G$-dimensional quadratic program.
+
+\paragraph{MGDA as ``parameter golf.''}
+It is worth naming the principle MGDA embodies, because it is the same one
+that drives the inference-time search this paper is written to serve.  An
+agent like AIDE plays \emph{parameter golf}: reach the target in the fewest
+strokes by making the \emph{smallest} change that improves the metric without
+breaking what already works.  MGDA is the gradient-space version of exactly
+that move---among all convex combinations that do not regress any axis, it
+takes the one of \emph{minimum norm}, the least-committal step that still
+improves.  The paper's two halves are thus one idea at two levels:
+constrained minimal-move ascent at the solution level (the search) and at the
+gradient level (the update).  The min-norm choice is conservative by
+construction, which is also why on a near-collinear code it collapses to
+averaging (below): there is no cheap stroke that distinguishes the axes.
 
 \begin{algorithm}[h]
-\caption{MGDA-VPO}\label{alg:mgda-vpo}
+\caption{MGDA in coefficient space}\label{alg:mgda-vpo}
 \begin{algorithmic}[1]
-\Require Policy $\pi_\theta$, $K$ advantage functions $\{A_k\}_{k=1}^K$,
-  learning rate $\eta$, group size $G$
+\Require Policy $\pi_\theta$, $K$ advantage functions $\{A_k\}$, learning
+  rate $\eta$, group size $G$
 \For{each training step}
-  \State Generate $G$ rollouts $\{\tau_i\}_{i=1}^G$ via $\pi_\theta$
-  \For{$k = 1, \ldots, K$}
-    \State Compute per-rollout advantage $A_k(\tau_i)$ over the group
-           (z-score normalised)
-    \State Compute gradient $\bm{g}_k \gets
-           \E\big[\nabla_\theta \log \pi_\theta(\tau) \cdot A_k(\tau)\big]$
-           \Comment{$K$ backward passes}
-  \EndFor
-  \State Solve convex QP on the simplex:
-         \[
-           \bm{\alpha}^* = \argmin_{\bm{\alpha} \in \Delta^{K-1}}
-                           \big\|\textstyle\sum_{k=1}^K \alpha_k \bm{g}_k\big\|^2
-         \]
-  \State Update: $\theta \gets \theta + \eta \sum_{k=1}^K \alpha_k^* \bm{g}_k$
+  \State Generate $G$ rollouts $\{\tau_i\}$; form per-trajectory gradients
+         $v_i = \nabla_\theta \log\pi_\theta(\tau_i)$
+  \State Compute $A_{ki} = A_k(\tau_i)$ (z-scored over the group) and the
+         Gram matrix $M_{ij}=\langle v_i,v_j\rangle$
+  \State Solve $\bm\alpha^* = \argmin_{\bm\alpha\in\Delta^{K-1}}
+         (A^\top\bm\alpha)^\top M (A^\top\bm\alpha)$
+         \Comment{$G\!\times\!G$ QP, negligible cost}
+  \State Update $\theta \gets \theta + \tfrac{\eta}{G}\, V A^\top \bm\alpha^*$
 \EndFor
 \end{algorithmic}
 \end{algorithm}
 
-\paragraph{Properties.}
+\paragraph{Properties and an honest caveat.}
 \begin{itemize}[nosep]
-\item When all $K$ gradients point in a similar direction, $\bm{\alpha}^*$
-  is near-uniform and MGDA-VPO reduces to gradient averaging.
-\item When axes conflict, $\bm{\alpha}^*$ picks the compromise direction
-  that improves \emph{all} axes simultaneously.
-\item If no such direction exists (Pareto front reached), $\|\sum
-  \alpha_k^* \bm{g}_k\|^2 = 0$ and the update is zero---this is
-  \emph{not} a bug but a signal: the policy is Pareto-stationary and
-  further improvement requires relaxing one axis.
+\item When the rows of $A$ are near-collinear, $\bm\alpha^*$ is essentially
+  unconstrained and MGDA reduces to averaging---the V2 regime.
+\item When axes genuinely conflict, $\bm\alpha^*$ selects a compromise that
+  decreases the min-norm objective.
+\item \textbf{The ``zero update means Pareto-stationary'' claim must be
+  softened.}  MGDA's guarantee is a property of a \emph{Pareto-stationary
+  point under deterministic gradients}.  Here the $v_i$, and hence
+  $\bm g_k$, are \emph{noisy minibatch estimates}; the min-norm criterion is
+  biased toward gradient \emph{cancellation}, so $\|\sum\alpha^*_k\bm
+  g_k\|\!\approx\!0$ can be sampling noise rather than true stationarity.
+  We therefore treat a near-zero MGDA update as a diagnostic to investigate
+  (variance estimate over microbatches), not as a convergence certificate.
 \end{itemize}
-
-\paragraph{Closed-form for $K \leq 3$.}
-For $K = 2$, the QP has a closed-form solution (Sener \& Koltun 2018).
-For $K = 3$ (our case with strict/jaccard/exit), the QP can be solved
-analytically or via a single call to a tiny QP solver with negligible
-overhead.
-
-\paragraph{Compute cost.}
-MGDA-VPO requires $K$ backward passes per training step.  For $K = 3$
-this is $3\times$ the backward cost.  Mitigation strategies:
-\begin{itemize}[nosep]
-\item Use a single fused backward with $K$ loss heads (accumulate
-  per-axis $\bm{g}_k$ without materialising $K$ separate
-  backward-call overhead).
-\item Use \emph{ MGDA-Approx}: compute one backward with the
-  Dirichlet-mixed advantage (as in V2), then a second with the
-  \emph{worst-axis} advantage; combine the two gradients via MGDA.
-  This captures most of the benefit at $2\times$ cost.
-\end{itemize}
+This caveat is the main reason we do not lead with MGDA: on a well-designed,
+genuinely non-collinear code, the choice of combiner (MGDA vs.\ tuned
+scalarisation) matters far less than the design of the code itself---a point
+the multi-task-learning literature has made forcefully
+(Section~\ref{sec:related}).
 
 % ======================================================================
-\section{When Does VPO Earn Its Keep?}
+\section{Matryoshka Reward Decomposition (MRD)}
+\label{sec:mrd}
+
+Every method in Section~\ref{sec:spectrum} assumes a vector reward whose
+axes carry independent information.  Where does such a vector come from?
+The earlier Vector-$\lambda$ work \emph{hand-picked} three axes and got two
+collinear ones.  MRD makes the reward code \emph{learned, nested, and
+partially interpretable} instead.
+
+\subsection{Design goals}
+
+\begin{enumerate}[nosep]
+\item \textbf{Don't choose $K$.}  We want a spectrum, not a fixed axis count.
+\item \textbf{Separate what is separable; leave the rest fuzzy.}  A few
+  dimensions should be explicitly disentangled and human-named (correctness,
+  format); the remainder should be allowed to stay entangled in latent
+  space rather than forced into spurious orthogonality.
+\item \textbf{Serve search.}  The interpretable head should give controllable
+  steering; the entangled tail should supply uncontrolled-but-useful
+  diversity.
+\end{enumerate}
+
+\subsection{A nested, sparse reward code}
+
+Train an encoder $z(\tau)\in\R^D$ over the teacher's signals (or over a
+reward model's residual stream---see the mechanistic-interpretability
+connection below), with three losses:
+
+\paragraph{(i) Matryoshka nesting (Kusupati et al.\ 2022).}
+Require every prefix $z_{1:k}$ to already reconstruct the dominant reward:
+\begin{equation}
+  \mathcal{L}_{\mathrm{nest}}
+  = \sum_{k \in \mathcal{K}} w_k\,
+    \big\| \hat r(z_{1:k}) - r^\star \big\|^2,
+  \qquad \mathcal{K} = \{1,2,4,8,\dots\},
+\end{equation}
+so early dimensions carry coarse, dominant signal (correctness) and later
+dimensions carry progressively finer, more specialised signal (format,
+brevity, intermediate-state path).  Nesting makes ``how many axes'' a
+\emph{readout choice at train/inference time}, not an architecture
+decision---and absorbs the old ``adaptive $K$ / $L_0$-on-the-simplex'' open
+question as a built-in property.
+
+\paragraph{(ii) Head disentanglement.}
+Apply a sparsity + orthogonality penalty \emph{only} to the head dimensions
+$z_{1:h}$:
+\begin{equation}
+  \mathcal{L}_{\mathrm{head}}
+  = \lambda_{\mathrm{sp}} \|z_{1:h}\|_1
+  + \lambda_{\mathrm{orth}} \big\| \mathrm{Corr}(z_{1:h}) - I \big\|_F^2 ,
+\end{equation}
+pushing the head toward monosemantic, near-independent, human-auditable
+reward features.
+
+\paragraph{(iii) A deliberately entangled tail.}
+Leave $z_{h+1:D}$ dense and unregularised: a learned residual that captures
+hard-to-name quality the head cannot express.  We do \emph{not} try to
+factorise it.  This is the technical content of ``some things are fuzzy in
+the latent space and you don't try to explicitly separate everything'': the
+tail is where the model is allowed to be vague, and the diversity search
+exploits comes disproportionately from it.
+
+\subsection{Optimisation: a matryoshka prior over scalarisations}
+
+We then run the cheap coefficient-space machinery of
+Section~\ref{sec:subspace} over the code rather than over hand axes.  Per
+step we sample a mixing vector with a \emph{nesting prior}---more mass on
+early dimensions, exponentially decaying into the tail:
+\begin{equation}
+  \bm\lambda \sim \mathrm{Dir}(\alpha_1,\dots,\alpha_D),
+  \qquad \alpha_d \propto \gamma^{\,d},\;\; 0<\gamma<1,
+\end{equation}
+and form the per-axis advantages and update exactly as in
+Eqs.~\eqref{eq:gk}--\eqref{eq:gram}.  Because all of this is reweighting in
+the $G$-dimensional subspace, sampling many $\bm\lambda$ per step is free,
+and each $\bm\lambda$ defines a specialist the downstream selector can later
+choose among:
+
+\begin{itemize}[nosep]
+\item \textbf{Head-heavy $\bm\lambda$}: controllable specialists (``correct
+  and well-formatted''), the axes a user or outer search loop can steer on.
+\item \textbf{Tail-touching $\bm\lambda$}: diversity injectors that push the
+  policy into uncovered regions without a human-named objective.
+\end{itemize}
+
+\subsection{The mechanistic-interpretability connection}
+
+If the encoder is an \emph{sparse autoencoder} over a reward model's
+activations, the head dimensions are literally SAE features of ``reward,''
+and MRD becomes: extract a sparse, near-monosemantic basis for the teacher's
+notion of quality (cf.\ dictionary-learning work on monosemantic features),
+keep the few features that are interpretable and independent as the steering
+head, and treat the dense reconstruction residual as the fuzzy tail.  This
+gives a principled, auditable answer to ``what are the reward axes?''---they
+are discovered features, not guesses---while explicitly conceding that not
+everything the teacher rewards will be monosemantic, and not forcing it to
+be.
+
+% ======================================================================
+\section{When Does Structured Reward Earn Its Keep? A Predictive Law}
 \label{sec:when}
 
-The central question is not ``is VPO good?'' but rather:
+The central question is not ``is the method good?'' but \emph{when} the
+reward code carries information a scalar cannot represent.  We promote this
+from a caveat to a measured, predictive variable.
 
+\subsection{The degeneracy condition}
+
+If $A_k \approx c_k A_0 + \epsilon_k$ with
+$\mathrm{Var}(\epsilon_k) \ll \mathrm{Var}(c_k A_0)$ for all $k$, then by
+Eq.~\eqref{eq:gk} $\bm g_k \approx c_k \bm g_0$, every mixture is collinear,
+and \emph{no} combiner---MGDA, Dirichlet, or worst-axis---can beat tuned
+scalarisation.  This is not a weakness of any one rule; it is a property of
+the \emph{code}, which is exactly why MRD targets the code.
+
+\subsection{Correlation as the independent variable}
+
+We propose to \emph{sweep} inter-axis correlation rather than report a single
+point.  After collecting $G{=}8$ rollouts per task, form the pairwise Pearson
+matrix of the $K$ advantages and summarise it by its effective rank (or by
+$\bar\rho$, the mean off-diagonal $|\rho|$).  The paper's empirical claim
+becomes a curve:
 \begin{quote}
-\emph{When are the $K$ reward axes carrying independent information
-that a scalar cannot represent?}
+\emph{The gap between structured-reward and best-tuned-scalar performance
+is monotone increasing in the non-collinearity of the reward code, and
+$\approx 0$ when the code is rank-1.}
 \end{quote}
+V2 ($\bar\rho$ high, gap $\approx$ 1 pp) is the left end of this curve.  A
+result of this shape converts the honest ``it only helps sometimes'' into a
+\emph{predictive theory of when}, which is far stronger than a single win.
 
-\subsection{The degeneracy risk}
-
-If the per-axis advantages are highly correlated estimates of the same
-underlying ``goodness''---as is likely for $\mathrm{strict\_sim}$ and
-$\mathrm{jaccard\_sim}$, both of which measure output similarity---then
-MGDA-VPO degenerates to gradient averaging and we have paid $K\times$
-compute for nothing.
-
-Formally: if $A_k \approx c_k \cdot A_0 + \epsilon_k$ with
-$\mathrm{Var}(\epsilon_k) \ll \mathrm{Var}(c_k A_0)$ for all $k$,
-then $\bm{g}_k \approx c_k \bm{g}_0$ and the simplex solution places
-all weight on the dominant direction regardless of $\bm{\alpha}$.
-
-\subsection{Designing uncorrelated axes}
-
-VPO earns its keep when the axes are \emph{deliberately uncorrelated}.
-In the privileged-teacher setting, this means choosing feedback
-dimensions that probe independent facets of quality:
+\subsection{Candidate axes for the bash-agent domain}
 
 \begin{table}[h]
 \centering
-\caption{Candidate reward axes for VPO in the bash-agent domain.}
+\caption{Candidate reward axes and their expected correlation with the
+dominant correctness axis.  MRD's job is to \emph{discover} a basis like
+this rather than assume it.}
 \label{tab:axes}
 \begin{tabular}{@{}llc@{}}
 \toprule
-\textbf{Axis} & \textbf{Source} & \textbf{Correlation with correctness?} \\
+\textbf{Axis} & \textbf{Source} & \textbf{Corr.\ with correctness} \\
 \midrule
-Answer correctness & Ground-truth oracle & Perfect (dominant axis) \\
+Answer correctness & Ground-truth oracle & Perfect (dominant / head dim 1) \\
 Tool-call format validity & Syntactic check & Moderate \\
 Reasoning consistency & LLM judge or heuristic & Moderate \\
 Brevity (negative length) & Cheap, mechanical & Low \\
@@ -293,167 +562,503 @@ Exit code 0 & Mechanical & Moderate \\
 \end{tabular}
 \end{table}
 
-The key insight: axes 3--5 have \textbf{low} correlation with axis 1
-(correctness).  A trajectory can be correct but verbose, or correct but
-use a different internal state path.  These are exactly the dimensions
-where a scalar advantage would conflate ``correct but suboptimal'' with
-``partially correct but efficient,'' and where VPO's gradient-level
-vector preservation can separate the two signals.
-
-\subsection{Empirical test}
-
-The simplest test for axis independence: after collecting $G{=}8$
-rollouts per task across the training set, compute the pairwise Pearson
-correlation matrix of the $K$ advantages.  If all off-diagonal entries
-$|\rho_{jk}| > 0.8$, VPO will not help.  If some $|\rho_{jk}| < 0.5$,
-VPO has room to contribute.
+Axes 4--5 (brevity, state-path) are low-correlation with correctness: a
+trajectory can be correct but verbose, or correct via a different internal
+path.  These are where a scalar conflates ``correct but suboptimal'' with
+``partially correct but efficient,'' and where a non-collinear code has room
+to separate the signals.
 
 % ======================================================================
-\section{Proposed Experiment: Exp19 --- MGDA-VPO}
-\label{sec:exp19}
+\section{Experiments}
+\label{sec:exp}
 
-A drop-in replacement for V2's Dirichlet mixing step.
+\subsection{What the flagship must show}
 
-\paragraph{Design.}
-\begin{enumerate}
-\item Reuse V2's three reward axes: $\mathrm{strict\_sim}$,
-  $\mathrm{jaccard\_sim}$, $\mathrm{exit\_success}$.
-\item Compute three z-scored advantages $A_{\mathrm{strict}}$,
-  $A_{\mathrm{jaccard}}$, $A_{\mathrm{exit}}$ (instead of one
-  Dirichlet-mixed advantage).
-\item Compute three policy gradients via three masked-backward passes
-  (or one fused pass with three loss heads).
-\item Solve the 3-simplex MGDA QP analytically per step.
-\item Compare to V2 (Dirichlet-mixed) and V1 (single scalar).
+An oral-grade result needs the structured method \emph{run} and winning by a
+margin that is not noise, with the mechanism isolated.  We therefore do not
+lead with the near-collinear three-axis setup (which is engineered to
+produce a null); we lead with the diversity and correlation-sweep results.
+
+\subsection{Measured reward-axis correlation (first result)}
+\label{sec:exp-corr}
+
+We ran the K=5 MRPO reward code (Qwen2.5-1.5B-Instruct, GRPO with weight sync,
+the same bash sandbox as Exp9/10, on a 2$\times$L40S pod) and logged every
+group's reward vector.  Table~\ref{tab:corr-measured} reports the Pearson
+correlation matrix pooled over $1408$ rollouts ($16$ training steps $\times$
+$11$ groups $\times$ $8$ rollouts).  The measurement confirms the paper's
+central structural claim directly:
+\begin{itemize}[nosep]
+\item $\mathrm{strict\_sim}$ and $\mathrm{jaccard\_sim}$ are \textbf{collinear}
+  ($\rho = 0.95$): the K=3 V2 code is effectively rank-2, which is exactly why
+  V2 beat V1 by only $\sim$1\,pp (Section~\ref{sec:background}).
+\item The two new axes are \textbf{near-orthogonal} to the similarity axes:
+  $\mathrm{brevity}$ at $\rho \approx -0.10$ and $\mathrm{tool\_format}$ at
+  $\rho \approx -0.03$. They inject genuinely independent information.
+\item The full code has effective rank $3.92/5$ (mean off-diagonal
+  $|\rho| = 0.161$), versus $\approx 2$ for the V2 triple.
+\end{itemize}
+This is the left-endpoint anchor of the correlation law
+(Section~\ref{sec:when}): the V2 result lives at high $\bar\rho$ where no
+combiner can help, and the MRPO axes are what move the code off that point.
+
+\begin{table}[h]
+\centering
+\caption{Measured reward-axis Pearson correlation for the K=5 MRPO code,
+pooled over $1408$ rollouts. mean$|\rho_{\mathrm{off}}| = 0.161$, effective
+rank $= 3.92/5$. \texttt{strict}/\texttt{jaccard} are collinear ($0.95$);
+\texttt{brevity}/\texttt{tool\_format} are near-orthogonal to all others.}
+\label{tab:corr-measured}
+\begin{tabular}{@{}lrrrrr@{}}\toprule
+ & strict & jaccard & exit & brevity & tool\_fmt \\ \midrule
+strict     &  1.00 &  0.95 &  0.16 & -0.10 & -0.02 \\
+jaccard    &  0.95 &  1.00 &  0.15 & -0.09 & -0.03 \\
+exit       &  0.16 &  0.15 &  1.00 &  0.06 &  0.01 \\
+brevity    & -0.10 & -0.09 &  0.06 &  1.00 & -0.04 \\
+tool\_fmt  & -0.02 & -0.03 &  0.01 & -0.04 &  1.00 \\
+\bottomrule\end{tabular}
+\end{table}
+
+\subsection{Measured best@$k$ across seeds: what survives, and what was seed luck}
+\label{sec:exp-bestk}
+
+We trained each policy for $200$ GRPO steps with the verifier-free similarity
+reward and evaluated unbiased pass@$k$ (best@$k$) on the $14$ checkable bash
+tasks, $n{=}16$ samples each.  Crucially we run \emph{three seeds} per trained
+policy and report mean$\pm$std (Table~\ref{tab:bestk}); the base policy is
+untrained, so it has a single curve.  The seeds change the story relative to
+single-seed runs, and we report only the seed-robust version.
+
+\paragraph{What is robust.}
+\begin{itemize}[nosep]
+\item \textbf{A quality-misaligned axis collapses the policy, deterministically.}
+  The K=5 set (K=3 plus brevity and tool-format) collapses to best@$k=0$ in
+  \emph{every} seed ($0.000\pm0.000$).  Rollout inspection shows the mechanism:
+  the policy stops emitting tool calls and degenerates to terse bare-text
+  outputs (e.g.\ the literal string \texttt{wc /etc/hosts}, mean completion
+  $\approx 3$ tokens) that are trivially self-similar and thus maximise the
+  consensus reward \emph{without doing the task}---reward hacking by format
+  collapse.  K=3 vs.\ K=5 is a clean single-variable ablation and brevity is the
+  culprit: it is \emph{non-collinear} with the similarity axes
+  (Table~\ref{tab:corr-measured}, $\rho\approx-0.10$) yet directly rewards the
+  short degenerate outputs.  Hence the corrected form of the correlation law:
+  \begin{quote}\emph{Non-collinearity of reward axes is necessary but not
+  sufficient; an axis must also be quality-aligned.  A non-collinear,
+  quality-misaligned axis (brevity) accelerates collapse rather than preventing
+  it.}\end{quote}
+  This is exactly the condition MRD (Section~\ref{sec:mrd}) enforces by
+  \emph{learning} a quality-bearing head rather than hand-picking axes by eye.
+\item \textbf{The base policy has the highest diversity ceiling}
+  ($\text{best@}16 = 0.857$)---the coverage downstream search exploits.
+\item \textbf{Min-norm (MGDA) is the most stable trained policy}: the lowest seed
+  variance ($0.537\pm0.024$ at $k{=}1$) and it matches the base ceiling
+  ($0.857\pm0.058$).  It does \emph{not} beat tuned scalarisation on these
+  near-collinear axes---as predicted by the MTL literature and our
+  Section~\ref{sec:mgda} caveat---but it is markedly lower-variance than the
+  Dirichlet V2 control ($0.420\pm0.197$ at $k{=}1$), a regularising effect of
+  the min-norm step worth investigating with more seeds.
+\end{itemize}
+
+\paragraph{What did \emph{not} survive seeds.}
+On a single seed the non-collapsed policies appeared to lie on a clean
+best@$k$-slope gradient---we initially observed $+0.33$ (base) $>+0.21$
+(quality-aligned) $>+0.11$ (V2 consensus)---and the quality-aligned subset
+looked best (a $k{=}1$ of $0.665$ on that seed).  Across three seeds neither
+holds: the trained, non-collapsed policies have similar slopes ($+0.22$ to
+$+0.32$) with overlapping error bands, and the quality-aligned $k{=}1$ is
+$0.496\pm0.121$.  The seed-robust signal is therefore \emph{collapse vs.\ not},
+together with the \emph{variance} structure---not a fine-grained ordering among
+the healthy policies.  We state this explicitly because it is the Parameter-Golf
+discipline (results must hold across seeds; Jiang et al.\ 2025) applied to our
+own earlier single-seed numbers.
+
+\begin{table}[h]
+\centering
+\caption{Measured best@$k$ (unbiased pass@$k$) on $14$ bash tasks, $n{=}16$,
+node 7 of the a3mega H100 cluster ($\mathrm{mbs}{=}8$).  Trained policies:
+mean$\pm$std over 3 seeds; base is the untrained reference (1 seed).  Robust
+signals: the brevity (K=5) collapse is deterministic; MGDA is the lowest-variance
+trained policy and matches the base ceiling; the Dirichlet V2 control is
+high-variance.  Slope differences among non-collapsed policies are within seed
+noise.}
+\label{tab:bestk}
+\begin{tabular}{@{}lcccc@{}}\toprule
+Policy & $k{=}1$ & $k{=}4$ & $k{=}16$ & slope \\ \midrule
+base (untrained, 1 seed)   & $0.509$            & $0.747$            & $0.857$            & $+0.35$ \\
+MGDA, K=3                  & $0.537{\pm}.024$   & $0.745{\pm}.024$   & $0.857{\pm}.058$   & $+0.32$ \\
+quality-aligned, K=3       & $0.496{\pm}.121$   & $0.641{\pm}.069$   & $0.786{\pm}.058$   & $+0.29$ \\
+Dirichlet V2, K=3          & $0.420{\pm}.197$   & $0.570{\pm}.176$   & $0.643{\pm}.154$   & $+0.22$ \\
++brevity, K=5              & $0.000$            & $0.000$            & $0.000$            & $\;\;0.00$ \\
+\bottomrule\end{tabular}
+\end{table}
+
+\subsection{Min-norm gradient combination is the most reliable across seeds}
+\label{sec:exp-reliability}
+
+The seed variance above motivates a different question than ``which combiner has
+the best mean'': \emph{which is the most reliable?}  We turn the \emph{same} K=3
+quality-aligned reward vector into an update three ways---fixed equal weights,
+Dirichlet random scalarisation (V2), and MGDA min-norm---each over \textbf{ten
+seeds} (Table~\ref{tab:reliability}):
+\begin{itemize}[nosep]
+\item MGDA has \textbf{$\sim$5$\times$ lower seed variance} than either baseline
+  ($\pm0.035$ at $k{=}1$ vs.\ $\pm0.186$ Dirichlet and $\pm0.169$ fixed; $\pm0.046$
+  at $k{=}16$ vs.\ $\pm0.238$ and $\pm0.164$), and the gap \emph{widens} with more
+  seeds.
+\item MGDA also has the \textbf{highest mean} at every $k$ (best@16 $0.836$ vs.\
+  $0.707$ Dirichlet, $0.636$ fixed).
+\end{itemize}
+So on a near-collinear code the min-norm step does not merely tie tuned
+scalarisation on the mean (as the MTL literature reports); it is markedly
+\emph{more reliable}.  The mechanism is intuitive: min-norm shrinks the update
+exactly when the per-axis gradients disagree, damping the seed-dependent drift
+that fixed/random scalarisation lets through.  We argue \emph{reliability}, not
+mean performance, is the axis on which gradient-level vector methods earn their
+keep in RL post-training---and it is precisely the pain point the seeds exposed
+in Section~\ref{sec:exp-bestk}.
+
+\begin{table}[h]\centering
+\caption{Reliability of three combiners on the same K=3 quality-aligned axes,
+mean$\pm$std over \textbf{10 seeds}, best@$k$ on $14$ bash tasks ($n{=}16$).
+MGDA (min-norm) is $\sim$5$\times$ lower variance and highest mean at every $k$.}
+\label{tab:reliability}
+\begin{tabular}{@{}lccc@{}}\toprule
+Combiner & $k{=}1$ & $k{=}4$ & $k{=}16$ \\ \midrule
+Fixed weights   & $0.397{\pm}.169$ & $0.544{\pm}.161$ & $0.636{\pm}.164$ \\
+Dirichlet (V2)  & $0.454{\pm}.186$ & $0.610{\pm}.212$ & $0.707{\pm}.238$ \\
+MGDA (min-norm) & $\mathbf{0.515{\pm}.035}$ & $\mathbf{0.712{\pm}.031}$ & $\mathbf{0.836{\pm}.046}$ \\
+\bottomrule\end{tabular}
+\end{table}
+
+\paragraph{Collapse is abrupt but preceded by a warning window.}
+Evaluating intermediate checkpoints of the K=5 (+brevity) run gives a clean
+trajectory: best@16 holds at $0.79$--$0.86$ through step $40$, falls to $0.57$ by
+step $60$, and \emph{cliffs to $0$ by step $80$} (and stays there to $200$);
+pass@1 begins eroding earlier, from step $40$.  Format collapse is thus not
+instantaneous---there is a multi-step window in which greedy accuracy and output
+length decline before best@$k$ reaches zero---which supports a cheap
+reward-vs-held-out-correctness divergence detector and an automatic
+down-weight/early-stop intervention (future work).
+
+\paragraph{Two reward-design knobs, reported honestly.}
+A \emph{coverage} reward (reward distinctness from the group, gated by validity,
+instead of consensus) produces the steepest best@$k$ slope of any trained policy
+(over 8 seeds, $+0.54$: a low but stable greedy pass@1 of $0.162\pm0.034$
+climbing to best@16 $0.705\pm0.121$)---it genuinely trains \emph{for} diversity.
+At the search-relevant end it \emph{beats the consensus reward} (best@16 $0.705$
+vs.\ $0.643$ for V2 consensus), confirming that optimising for diversity rather
+than agreement helps where search operates---though it still does not exceed the
+untrained base ceiling ($0.857$), so it is a usable exploration/exploitation knob
+rather than a dominance result.  Pooling distinct specialist policies (an
+inference-time ensemble) likewise beats the best single policy only at the
+large-$k$ end ($+0.02$ at $k{=}16$); directed diversity helps a little exactly
+where it should.
+
+\subsection{Setup}
+
+All runs use Qwen2.5-1.5B-Instruct, GRPO with weight sync, the verifier-free
+terminal-similarity reward, $G{=}8$, $\mathrm{lr}{=}10^{-5}$,
+$\mathrm{lora\_rank}{=}16$, $200$ steps.  The reward-axis correlation
+(Section~\ref{sec:exp-corr}) was measured on an earlier 2$\times$L40S run;
+the best@$k$ results (Section~\ref{sec:exp-bestk}) are on one node of an
+8$\times$H100 cluster at $\mathrm{mbs}{=}8$, vLLM serving on one GPU and the
+trainer on another, three seeds per trained policy run in parallel across the
+node.  best@$k$ is the unbiased pass@$k$ estimator over $n{=}16$ samples on the
+$14$ bash tasks with a checkable answer.  All policies are evaluated on the same
+node, so the (imperfectly calibrated) answer oracle biases every row equally and
+the \emph{differences}, not the absolute values, are the signal.
+
+\subsection{Generalisation across tasks}
+\label{sec:exp-crosstask}
+
+To test whether these findings are bash-specific, we ran the same comparison on
+standard tasks with the identical stack (Qwen2.5-1.5B, $n{=}16$ best@$k$, 3
+seeds): \textbf{GSM8K} (single-turn math), \textbf{MBPP} code generation (a
+genuinely multi-axis task: \texttt{tests\_pass} / format / brevity), and
+\textbf{Wordle} (multi-turn).  We reuse the env's own per-function rubric scores
+as the reward axes, and compare combining them by Dirichlet, fixed weights, and
+MGDA against the status-quo verifier-GRPO baseline (Table~\ref{tab:crosstask}).
+The picture is \emph{nuanced and consistent with the axis-structure law}:
+\begin{itemize}[nosep]
+\item \textbf{Where axes carry real signal, the min-norm benefit replicates.}
+  On MBPP, MGDA is the \emph{lowest-variance} vector method ($0.183\pm0.005$ vs.\
+  Dirichlet $0.107\pm0.062$, fixed $0.123\pm0.039$) and ties the best mean.  On
+  GSM8K the effect is dramatic: combining the answer-consensus axes by MGDA holds
+  best@16 at $0.930\pm0.008$, while Dirichlet and fixed scalarisation
+  \emph{collapse} to $\approx0.40\pm0.06$.  Min-norm avoids the collapse the other
+  combiners suffer, and is again the lowest-variance.
+\item \textbf{The verifier-free consensus collapse also replicates}: on GSM8K,
+  optimising answer-agreement drops greedy accuracy from $0.50$ (base) to $0.13$
+  --- the bash format-collapse phenomenon, on a standard benchmark.
+\item \textbf{A clean failure mode, reported honestly.}  On Wordle MGDA is
+  \emph{worst} ($0.017$ vs.\ Dirichlet $0.367$).  Wordle is a floor task for a
+  1.5B model---it essentially never wins, so the win/turn axes are constant and
+  only a near-degenerate partial-credit signal remains.  In that regime MGDA's
+  min-norm step (which on noisy gradients is biased toward cancellation,
+  Section~\ref{sec:mgda}) shrinks the update to near zero and the policy stays at
+  the losing base; the higher post-training entropy confirms it barely moved.
+  This is the same conservatism that \emph{helps} on signal-bearing axes,
+  manifesting as a \emph{vice} when there is no real signal to preserve.
+\end{itemize}
+So the benefit of min-norm is not universal: it tracks exactly the condition the
+paper predicts---non-collinear axes that carry genuine, non-degenerate
+signal---holding on GSM8K and MBPP and failing on the Wordle floor.  (Two further
+tasks we ran were uninformative for this comparison and are omitted from the
+table: a synthetic tool-call env saturates at ceiling for all methods, and
+reasoning-gym gave no separation between combiners.)
+
+\paragraph{The effect strengthens with scale.}
+To check that this is not a small-model artifact, we repeated the GSM8K
+comparison with \textbf{Qwen2.5-7B-Instruct} (3 seeds; Table~\ref{tab:scale}).
+The result is the same phenomenon, sharper: verifier-free Dirichlet and fixed
+scalarisation \emph{collapse completely} (best@16 $\to 0.000$ and $0.013$), while
+\textbf{MGDA fully preserves} the base / verifier-GRPO level
+($0.973\pm0.005$).  The collapse the baselines suffer \emph{deepens} from
+$\approx0.40$ at 1.5B to $\approx0$ at 7B, and MGDA's collapse-avoidance holds
+throughout---so the reliability advantage is not an artifact of a small policy;
+if anything the gap widens with capability.  The same ordering---MGDA matching
+verifier-GRPO and exceeding both scalarisation baselines---also reproduces at 7B
+on MBPP, though the separation there is compressed near that task's low ceiling
+and within seed noise; Wordle stays a floor for every method at 7B as at 1.5B.
+The decisive scale evidence is therefore GSM8K, where the dynamic range is large
+enough for the collapse to be unambiguous.
+
+\begin{table}[h]\centering
+\caption{GSM8K best@$k$ at 1.5B vs.\ 7B (Qwen2.5-Instruct; mean$\pm$std, 3
+seeds). Verifier-free Dirichlet/fixed scalarisation collapse---catastrophically
+at 7B---while MGDA preserves base performance at both scales.}
+\label{tab:scale}
+\begin{tabular}{@{}lcccc@{}}\toprule
+GSM8K best@16 & verifier-GRPO & Dirichlet & MGDA & fixed \\ \midrule
+1.5B & $0.953{\pm}.009$ & $0.437{\pm}.065$ & $\mathbf{0.930{\pm}.008}$ & $0.397{\pm}.061$ \\
+7B   & $0.973{\pm}.005$ & $0.000{\pm}.000$ & $\mathbf{0.973{\pm}.005}$ & $0.013{\pm}.019$ \\
+\bottomrule\end{tabular}
+\end{table}
+
+\begin{table}[h]\centering
+\caption{Cross-task best@16 (mean$\pm$std, 3 seeds, $n{=}16$).  MGDA is
+lowest-variance and avoids collapse where axes carry real signal (MBPP, GSM8K),
+and fails in the degenerate-axis floor regime (Wordle).  GSM8K baseline is
+verifier-GRPO (ground truth); the vector methods are verifier-free.}
+\label{tab:crosstask}
+\begin{tabular}{@{}lcccc@{}}\toprule
+Task & baseline & Dirichlet & MGDA & fixed \\ \midrule
+MBPP (code, multi-axis)   & $0.183{\pm}.017$ & $0.107{\pm}.062$ & $\mathbf{0.183{\pm}.005}$ & $0.123{\pm}.039$ \\
+GSM8K (single-axis)       & $0.953{\pm}.009$ & $0.437{\pm}.065$ & $\mathbf{0.930{\pm}.008}$ & $0.397{\pm}.061$ \\
+Wordle (floor regime)     & $0.100$          & $\mathbf{0.367}$ & $0.017$ & $0.183$ \\
+\bottomrule\end{tabular}
+\end{table}
+
+\subsection{Remaining experiments}
+\label{sec:remaining}
+
+The results above establish the correlation structure
+(Section~\ref{sec:exp-corr}), the diversity findings
+(Section~\ref{sec:exp-bestk}), and---now run---the MGDA coefficient-space
+update.  MGDA (Alg.~\ref{alg:mgda-vpo}) forms the $N\times N$ Gram of
+per-trajectory gradients, solves the simplex min-norm QP (cost independent of
+the number of axes $K$), and feeds $\beta=A^\top\alpha^*$ to the existing single
+backward---no per-axis backward pass; the solver's $Q=AMA^\top$ factorisation
+and $\sum_i\beta_i v_i = \sum_k\alpha_k g_k$ identity are unit-tested.  On the
+collinear K=3 axes it does not beat tuned scalarisation (as the MTL literature
+predicts), but is the lowest-variance trained policy across seeds
+(Table~\ref{tab:bestk})---a regularising effect of the min-norm step.  Three
+further directions would round out the paper (we ran a minimal version of the
+third below):
+\begin{enumerate}[nosep]
+\item \textbf{The correlation sweep.}  Interpolate reward codes from rank-1 to
+  the head/tail MRD code and plot a seed-averaged metric (best@$k$ ceiling or
+  collapse rate, with error bars) against effective rank
+  (Section~\ref{sec:when}); the collapse-vs-not boundary we observe is the first,
+  coarsest sample of that curve.
+\item \textbf{The learned MRD code.}  Replace hand axes with the SAE/matryoshka
+  code (Section~\ref{sec:mrd}) and test whether a learned quality-bearing head
+  preserves best@$k$ where hand axes did not.  A \emph{tuned} scalar baseline
+  (best fixed $\bm w$) is the control the MTL literature demands.
+\item \textbf{Feedback-guided search (AIDE-style), with a caveat.}  best@$k$ is
+  the \emph{i.i.d.}\ measurement.  Production search (AIDE; Jiang et al.\ 2025) is
+  \emph{sequential}---each candidate conditioned on the previous failure.  We ran
+  a \emph{minimal} version (linear, beam-1: propose, execute, read the error,
+  re-prompt, repeat to budget $B{=}8$) on base, a healthy policy, and the
+  format-collapsed K=5 policy.  One result is clean and one is a caveat:
+  \emph{(i)} the collapsed policy is \textbf{unrecoverable by search}
+  ($0\!\to\!0$ solve@$B$; with no valid tool call it has nothing to propose),
+  confirming that format collapse is a capability loss search cannot repair;
+  \emph{(ii)} on these simple single-command tasks the linear feedback loop does
+  \emph{not} beat i.i.d.\ at equal budget ($0.71$ vs.\ $0.79$ for base and
+  healthy alike)---the error signal adds little when each task is one command.
+  A tree/beam search over harder, multi-step tasks (where AIDE's gains actually
+  arise) is the proper test and remains future work.
 \end{enumerate}
 
-\paragraph{Expected outcome with correlated axes.}
-Since $\mathrm{strict\_sim}$ and $\mathrm{jaccard\_sim}$ are correlated,
-MGDA-VPO will behave like averaging and land within $\pm 2$ pp of V2.
-This is the \emph{null result}---valuable because it confirms the
-degeneracy hypothesis.
+% ======================================================================
+\section{Limitations and Generalisation}
+\label{sec:limitations}
 
-\paragraph{The interesting variant.}
-Add deliberately uncorrelated axes---a brevity penalty and a
-tool-call-format validity check---and see whether MGDA-VPO opens a gap.
-If it does, the contribution is: \emph{VPO with well-designed
-uncorrelated axes outperforms any scalarisation.}
+The core findings were developed on a bash tool-use task and then replicated on
+GSM8K, MBPP, and Wordle (Section~\ref{sec:exp-crosstask}); the principal
+remaining limitation is that every run uses \emph{one} small model
+(Qwen2.5-1.5B).  We are explicit about which claims transfer and which still need
+work.
 
-\paragraph{Experimental controls.}
-\begin{itemize}[nosep]
-\item Same environment as Exp9/10 (nodeset3 H100, same bash sandbox).
-\item Same $\mathrm{mbs}=8$, $G=8$, $\mathrm{lr}=10^{-5}$,
-  $\mathrm{lora\_rank}=16$.
-\item Same weight-sync protocol.
-\item $\mathrm{max\_steps} = 200$ with $\mathrm{save\_steps} = 50$ for
-  early-stopping analysis.
-\end{itemize}
+\paragraph{What is task/model-agnostic.}
+The subspace result (Section~\ref{sec:subspace})---that all per-axis gradients
+lie in the span of the group's per-trajectory gradients, so any combiner is a
+cheap reweighting---is a property of outcome-level policy gradients, not of this
+task or model.  Likewise, measuring a reward code's structure needs nothing
+task-specific: collect a group of base-model rollouts on the new task, compute
+each candidate axis on them, and take the Pearson matrix / effective rank of the
+per-axis advantages (Section~\ref{sec:when}).  This is exactly how one would
+decide, for a \emph{new} task, whether vector rewards can help before training.
+
+\paragraph{What is now shown across tasks, and what is not.}
+Two of the three claims hold beyond bash (Section~\ref{sec:exp-crosstask}): the
+consensus/agreement collapse recurs on GSM8K, and the min-norm reliability /
+collapse-avoidance advantage recurs on GSM8K and MBPP---while Wordle gives a
+clean counter-case that sharpens the condition (the benefit needs
+non-degenerate, signal-bearing axes; a floor task where the model never succeeds
+breaks it).  The effect is \emph{not} a small-model artifact: at \textbf{7B} on
+GSM8K (Table~\ref{tab:scale}) the verifier-free baselines collapse even harder
+(best@16 $\to 0.000$/$0.013$) while MGDA preserves the base level
+($0.973$)---the reliability gap widens with scale rather than closing.  The
+standing gaps are: \emph{(i)} broader scale and task coverage---we verify the
+effect at 7B on one task, but a full scale$\times$task grid (and $>$10B) remains;
+\emph{(ii)} harder benchmarks we could not run here (gated or judge-API-scored
+datasets such as GPQA/SimpleQA, and a competition-math env), which would give
+stronger correctness anchors; and \emph{(iii)} the learned MRD code itself, still
+to be trained (Section~\ref{sec:remaining}).
 
 % ======================================================================
 \section{Relation to Existing Work}
 \label{sec:related}
 
-\paragraph{Multi-task learning.}
-MGDA was introduced for multi-task learning by Sener \& Koltun (2018),
-who showed it produces Pareto-stationary updates for $K$ task losses.
-Our contribution is applying it to the \emph{advantage decomposition
-within a single RL step}, where each ``task'' is a reward axis from a
-privileged teacher.
+\paragraph{Concurrent set-construction work (Boldi et al.).}
+Concurrent work by Boldi et al.\ targets the same search-downstream regime with
+a different mechanism: emit $m$ candidate answers in one rollout (each attending
+to the previous) and score the set by best-of-$m$ under stochastically sampled
+scalarisation weights $\bm w\sim\mathrm{Dir}(1)$, so positions are incentivised
+to differ.  Two points of contact.  (1) Their reported failure mode---this helps
+only when reward components genuinely compete and \emph{loses} to GRPO when they
+are near-collinear (their UltraFeedback result)---is the same condition our
+Section~\ref{sec:when} formalises, independent confirmation that
+non-collinearity is the operative variable.  (2) Their advantage is broadcast
+over the whole multi-answer chain, so specialisation emerges only at the set
+level over many updates; our head/tail code instead makes \emph{which} axis
+earned reward explicit for the head while leaving the tail set-level.  Ours is
+thus the \emph{reward-decomposition} counterpart to their
+\emph{set-construction} approach.
 
-\paragraph{Multi-objective RL (MORL).}
-MORL learns a policy that trades off multiple objectives, typically by
-computing a Pareto front over policies.  VPO is different: we do not
-seek a set of Pareto-optimal policies but a \emph{single update
-direction} that improves all axes simultaneously at each step.
+\paragraph{Multi-task gradient methods, and the case against them.}
+MGDA (D\'{e}sid\'{e}ri 2012; Sener \& Koltun 2018) is one of a family
+including PCGrad (Yu et al.\ 2020), CAGrad (Liu et al.\ 2021), and Nash-MTL
+(Navon et al.\ 2022).  Crucially, Kurin et al.\ (2022) and Xin et al.\
+(2022) show that \emph{tuned unitary scalarisation usually matches or beats}
+these methods.  We take this seriously: it is precisely why we do not claim
+MGDA-the-combiner as the contribution, and instead locate the value in the
+\emph{design of the reward code} (MRD), where the choice of combiner is
+second-order.
 
-\paragraph{Reward shaping / potential-based shaping.}
-Ng et al.\ (1999) showed that potential-based reward shaping does not
-change the optimal policy.  VPO is not reward shaping: it changes the
-\emph{gradient direction}, not the reward value, and therefore can
-change which policy is optimal.
+\paragraph{Multi-objective RLHF.}
+Rewarded Soups (Ram\'e et al.\ 2023) builds a Pareto front by interpolating
+\emph{weights} of separately-trained experts; MORLHF, Directional Preference
+Alignment, and Panacea learn weight-conditioned policies.  These produce a
+\emph{family of policies} along a trade-off; MRPO instead shapes a
+\emph{single} policy to cover multiple strategies for a downstream selector,
+and learns the reward axes rather than assuming them.
 
-\paragraph{RLHF with process reward models (PRMs).}
-PRMs provide dense per-step rewards but still scalarise them.
-VPO would apply if the PRM had multiple independent heads (e.g.\
-correctness, safety, helpfulness) that were preserved at the gradient
-level rather than collapsed into a single score.
+\paragraph{Quality-diversity.}
+The ``spread the policy for search'' goal is kin to Quality-Diversity /
+MAP-Elites: MRD's interpretable head dimensions are candidate behaviour
+descriptors, and the tail is undirected novelty.  Framing the head as a QD
+descriptor space is a natural extension.
+
+\paragraph{Representation learning.}
+Matryoshka Representation Learning (Kusupati et al.\ 2022) supplies the
+nesting; sparse-autoencoder / dictionary-learning work on monosemantic
+features supplies the head-disentanglement; alignment/uniformity on the
+hypersphere (Wang \& Isola 2020) supplies a formal handle on the
+``uniformity = coverage for search'' intuition.
+
+\paragraph{Reward shaping.}
+Ng et al.\ (1999) showed potential-based shaping leaves the optimal policy
+unchanged.  MRD is not shaping: it changes the gradient \emph{direction} via
+the chosen $\bm\alpha$, not the reward potential, and can therefore change
+which policy is favoured.
 
 % ======================================================================
 \section{Open Questions}
 \label{sec:open}
 
 \begin{enumerate}
-\item \textbf{Critic architecture.}
-  $K$ separate critics (one per axis) vs.\ one critic with $K$-headed
-  output.  The headed critic shares representation and is cheaper, but
-  may produce correlated advantages---exactly the degeneracy we want to
-  avoid.
-
-\item \textbf{Compute cost.}
-  $K$ backward passes is $3$--$5\times$ the trainer cost at $K{=}3$--$5$.
-  Is there a single-backward variant that approximates MGDA?  Candidates:
-  (a) MGDA-Approx (one backward with mixed advantage, one with
-  worst-axis advantage); (b) Hessian-vector-product--based MGDA that
-  avoids explicit per-axis backward.
-
-\item \textbf{Stability with GRPO.}
-  GRPO's group-mean centring can push $\bm{\alpha}^*$ away from
-  improving directions early in training, when per-axis advantages are
-  noisy.  Does MGDA's ``stop when no improving direction exists''
-  behaviour interact badly with this?
-
-\item \textbf{Adaptive $K$.}
-  Can we learn which axes to track?  Start with $K{=}10$, prune axes
-  whose $\alpha_k^*$ drops below a threshold.  This is an $L_0$
-  regularisation problem on the simplex.
-
-\item \textbf{Generalisation beyond bash.}
-  In math (step-level checks), code (unit-test granularity), or agentic
-  tasks (intermediate state visibility), privileged teachers with
-  structured feedback are more naturally available.  Does VPO generalise
-  and does the axis-independence condition hold in those domains?
-
-\item \textbf{Theoretical analysis.}
-  Under what conditions does MGDA-VPO converge to a policy that
-  Pareto-dominates the scalarised baseline?  Can we bound the
-  improvement as a function of the inter-axis correlation matrix?
+\item \textbf{Encoder for the code.}  SAE over a reward model's residual
+  stream vs.\ a small supervised encoder over teacher signals.  How
+  monosemantic do head dims need to be before steering is reliable?
+\item \textbf{Noisy-gradient MGDA.}  Can the cancellation bias of
+  Section~\ref{sec:mgda} be corrected with a variance estimate over
+  microbatches, or does it argue for sticking to (matryoshka-prior)
+  stochastic scalarisation?
+\item \textbf{How fuzzy should the tail be?}  Is there an optimal head size
+  $h$, and does it track the effective rank of the teacher's reward?
+\item \textbf{Generalisation.}  Math (step checks), code (unit-test
+  granularity), and agentic tasks (intermediate-state visibility) all admit
+  privileged teachers.  Does the correlation law hold, and where do these
+  domains sit on the curve?
+\item \textbf{Theory.}  Bound the $\bestk$ improvement of MRPO over scalar
+  GRPO as a function of the reward code's effective rank.
 \end{enumerate}
 
 % ======================================================================
 \section{Positioning Relative to the Current Paper}
 \label{sec:positioning}
 
-The three findings of the current paper are complete and do not depend
-on VPO:
-\begin{enumerate}
-\item Variational self-consistency + weight sync = $+15$ pp (Exp9/10).
-\item Scalar self-similarity is a surprisingly strong baseline ($+13$ pp;
-  the variational machinery's incremental contribution is small).
+The three findings of the current (substrate) paper stand on their own:
+\begin{enumerate}[nosep]
+\item Variational self-consistency + weight sync $=+15$ pp (Exp9/10).
+\item Scalar self-similarity is a strong baseline ($+13$ pp); the
+  variational machinery's incremental contribution is small.
 \item DBPO (density reward) is a documented failure mode (format collapse).
 \end{enumerate}
-
-VPO is naturally a \textbf{follow-up paper} about \emph{how} to design
-the reward axes and \emph{how} to combine them, building on the same
-weight-synced GRPO + bash environment substrate.  The current paper
-establishes the substrate; VPO asks the next question.
+MRPO is the follow-up that asks the next question: not ``what reward,'' but
+``what \emph{structure} of reward, and how to combine it so the resulting
+diversity survives for search.''  It builds on the same weight-synced GRPO +
+bash substrate, reuses its rollouts, and---via
+Section~\ref{sec:subspace}---adds the vector machinery at almost no extra
+trainer cost.
 
 % ======================================================================
 \section*{References}
 \addcontentsline{toc}{section}{References}
 
 \begin{itemize}[nosep]
-\item D\'{e}sid\'{e}ri, J.-A. (2012).
-  \emph{Multiple-gradient descent algorithm for multiobjective
-  optimization}.  Comptes Rendus Mathematique, 350(5--6), 313--318.
-\item Sener, O. \& Koltun, V. (2018).
-  \emph{Multi-task learning as multi-objective optimization}.
-  NeurIPS 2018.
-\item Ng, A.~Y., Harada, D. \& Russell, S. (1999).
-  \emph{Policy invariance under reward transformations: Theory and
-  application to reward shaping}.  ICML 1999.
-\item Wang, T. \& Isola, P. (2020).
-  \emph{Understanding contrastive representation learning through
-  alignment and uniformity on the hypersphere}.  ICML 2020.
+\item Jiang, Z.\ et al.\ (2025). \emph{AIDE: AI-Driven Exploration in the
+  Space of Code}. arXiv:2502.13138. (Weco AI; tree-search ML-engineering agent,
+  the inference-time search regime this paper's training targets.)
+\item Boldi, R.\ et al.\ (2026). \emph{Vector Policy Optimization}.
+  (Concurrent; multi-answer chains with stochastic scalarisation.)
+\item D\'{e}sid\'{e}ri, J.-A. (2012). \emph{Multiple-gradient descent
+  algorithm for multiobjective optimization}. C.\ R.\ Mathematique,
+  350(5--6), 313--318.
+\item Sener, O. \& Koltun, V. (2018). \emph{Multi-task learning as
+  multi-objective optimization}. NeurIPS.
+\item Yu, T.\ et al.\ (2020). \emph{Gradient surgery for multi-task learning
+  (PCGrad)}. NeurIPS.
+\item Liu, B.\ et al.\ (2021). \emph{Conflict-averse gradient descent for
+  multi-task learning (CAGrad)}. NeurIPS.
+\item Navon, A.\ et al.\ (2022). \emph{Multi-task learning as a bargaining
+  game (Nash-MTL)}. ICML.
+\item Kurin, V.\ et al.\ (2022). \emph{In defense of the unitary
+  scalarization for deep multi-task learning}. NeurIPS.
+\item Xin, D.\ et al.\ (2022). \emph{Do current multi-task optimization
+  methods yield improvements?} NeurIPS Datasets/Benchmarks.
+\item Ram\'e, A.\ et al.\ (2023). \emph{Rewarded Soups: weight interpolation
+  for multi-objective alignment}. NeurIPS.
+\item Kusupati, A.\ et al.\ (2022). \emph{Matryoshka Representation
+  Learning}. NeurIPS.
+\item Wang, T. \& Isola, P. (2020). \emph{Understanding contrastive
+  representation learning through alignment and uniformity on the
+  hypersphere}. ICML.
+\item Ng, A.~Y., Harada, D. \& Russell, S. (1999). \emph{Policy invariance
+  under reward transformations}. ICML.
 \end{itemize}
 
 \end{document}

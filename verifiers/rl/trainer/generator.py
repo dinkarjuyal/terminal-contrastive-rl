@@ -14,12 +14,26 @@ from transformers import PreTrainedTokenizerBase
 
 from verifiers import Environment
 from verifiers.rl.trainer.terminal_similarity import (
+    DEFAULT_AXES,
+    answer_consensus_vector,
     compute_reward_vector,
     density_reward_per_rollout,
     mean_sim_per_rollout,
     select_pairs,
     trajectory_diversity,
 )
+
+
+def _dump_reward_vectors_to(path: str, rvecs: list[list[float]], axes: list[str]) -> None:
+    """Append a group's per-rollout reward vectors to a JSONL file for offline
+    §7 correlation analysis. Best-effort; never raises into the training loop."""
+    import json as _json
+
+    try:
+        with open(path, "a") as f:
+            f.write(_json.dumps({"axes": axes, "rvecs": rvecs}) + "\n")
+    except OSError:
+        pass
 
 
 class Microbatch(BaseModel):
@@ -90,6 +104,9 @@ class Generator:
         use_density_tc: bool = False,
         density_bandwidth: float = 0.2,
         use_scalar_self_sim_grpo: bool = False,
+        reward_axes: list[str] | None = None,
+        reward_vector_dump_path: str | None = None,
+        reward_source: str = "terminal",
     ):
         self.env = env
         self.client_base_url = client_base_url
@@ -120,6 +137,9 @@ class Generator:
         self.use_density_tc = use_density_tc
         self.density_bandwidth = density_bandwidth
         self.use_scalar_self_sim_grpo = use_scalar_self_sim_grpo
+        self.reward_axes = reward_axes  # None -> V2 default K=3
+        self.reward_vector_dump_path = reward_vector_dump_path
+        self.reward_source = reward_source  # "terminal" (bash) | "answer" (gsm8k/math)
 
         # queues for communication
         self.request_queue = queue.Queue()
@@ -131,6 +151,7 @@ class Generator:
         self.stop_event = threading.Event()
         self.logger = logging.getLogger(__name__)
         self.is_generating = False
+
         self.worker_loop = None
 
         max_length = self.max_prompt_len
@@ -151,6 +172,13 @@ class Generator:
             filter_by_prompt_length,
             fn_kwargs={"processing_class": processing_class},
         )
+
+    def _maybe_dump_reward_vectors(self, rvecs, axes):
+        """Append this group's reward vectors to the dump file (§7 analysis)."""
+        if self.reward_vector_dump_path:
+            _dump_reward_vectors_to(
+                self.reward_vector_dump_path, rvecs, axes or DEFAULT_AXES
+            )
 
     def get_dataset_slice(self, batch_id: int) -> Dataset:
         """Get dataset slice for a given batch id"""
@@ -343,23 +371,61 @@ class Generator:
         total_possible_pairs = 0
         use_tc = getattr(self, "use_terminal_contrastive", False)
 
+        reward_source = getattr(self, "reward_source", "terminal")
         if use_tc:
             for p in range(N):
                 # strided indices for this prompt (before reorder)
                 strided_indices = [p + k * N for k in range(G) if (p + k * N) < len(env_results.state)]
+
+                # Answer-based tasks (gsm8k/math): compute verifier-free vector reward
+                # from completions' final answers instead of terminal stdout.
+                if reward_source == "answer":
+                    if getattr(self, "use_vector_tc", False):
+                        completions = [env_results.completion[i] for i in strided_indices]
+                        axes = getattr(self, "reward_axes", None)
+                        rvecs = answer_consensus_vector(completions, axes=axes)
+                        for k, rv in enumerate(rvecs):
+                            global_reward_vectors[p * G + k] = rv
+                        self._maybe_dump_reward_vectors(rvecs, axes)
+                    continue
+
+                # Rubric-based multi-axis tasks (wordle, code, ...): use the env's own
+                # per-reward-function scores as the reward axes (the genuine multi-axis
+                # signal). reward_axes lists the rubric function names to use.
+                if reward_source == "rubric":
+                    if getattr(self, "use_vector_tc", False):
+                        axes = getattr(self, "reward_axes", None) or list(env_results.metrics.keys())
+                        rvecs = []
+                        for idx in strided_indices:
+                            rvecs.append([
+                                float(env_results.metrics.get(ax, [0.0] * len(env_results.reward))[idx])
+                                for ax in axes
+                            ])
+                        for k, rv in enumerate(rvecs):
+                            global_reward_vectors[p * G + k] = rv
+                        self._maybe_dump_reward_vectors(rvecs, axes)
+                    continue
+
                 first_state = env_results.state[strided_indices[0]] if strided_indices else {}
                 if "final_stdout" not in first_state:
                     continue  # env doesn't provide terminal outputs for this rollout
 
                 stdouts = [env_results.state[i].get("final_stdout", "") for i in strided_indices]
                 exit_codes = [env_results.state[i].get("exit_code", 0) for i in strided_indices]
+                completions = [env_results.completion[i] for i in strided_indices]
                 measure = getattr(self, "terminal_sim_measure", "strict")
 
                 if getattr(self, "use_vector_tc", False):
-                    # V2: store reward vectors; λ sampled fresh in trainer each step
-                    rvecs = compute_reward_vector(stdouts, exit_codes=exit_codes)
+                    # V2/MRPO: store reward vectors; λ sampled fresh in trainer each step.
+                    # axes default to V2's K=3; configs may request the K=5 MRPO set.
+                    axes = getattr(self, "reward_axes", None)
+                    rvecs = compute_reward_vector(
+                        stdouts, exit_codes=exit_codes,
+                        completions=completions, axes=axes,
+                    )
                     for k, rv in enumerate(rvecs):
                         global_reward_vectors[p * G + k] = rv
+                    self._maybe_dump_reward_vectors(rvecs, axes)
                     # Use strict dim as proxy diversity metric
                     strict_scores = [rv[0] for rv in rvecs]
                     mu = sum(strict_scores) / len(strict_scores)

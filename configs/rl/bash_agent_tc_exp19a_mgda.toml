@@ -1,0 +1,64 @@
+# Bash agent: MGDA-VPO (paper §3/§5) — coefficient-space min-norm over per-axis
+# gradients, NO K backward passes. Exp19a is the diagnostic null: run on the K=3
+# near-collinear axes [strict, jaccard, exit]. Because strict~jaccard (ρ=0.95,
+# Table tab:corr-measured), MGDA should ≈ V2/averaging — the left endpoint of the
+# correlation law. Compare to exp19_ctrl (K=3 Dirichlet V2) on the same pod.
+#
+# Mechanism: all K axis-gradients live in span of the N per-trajectory gradients;
+# we build the N×N Gram once and solve the simplex QP (cost independent of K),
+# then feed β=A^Tα* as the advantage to the existing single backward.
+#
+# Note: MGDA operates over the N=micro_batch_size rollouts in each microbatch;
+# set micro_batch_size = rollouts_per_example so a microbatch is one full group.
+# At mbs=8 this OOM'd on L40S 48GB; if so, lower rollouts_per_example to 4 (and
+# mbs=4) so group=microbatch without OOM.
+
+model = "Qwen/Qwen2.5-1.5B-Instruct"
+
+exclude_task_ids = ["find_py", "find_exec", "sort_uniq"]
+
+[env]
+id = "bash_agent"
+
+[inference]
+gpus = 1
+
+[inference.args]
+enforce_eager = true
+
+[trainer]
+gpus = 1
+
+[trainer.args]
+run_name = "bash-agent-tc-exp19a-mgda"
+report_to = "none"
+max_concurrent = 32
+
+use_lora = true
+lora_rank = 16
+learning_rate = 1e-5
+micro_batch_size = 8
+rollouts_per_example = 8
+batch_size = 88
+max_steps = 200
+save_steps = 20
+max_tokens = 512
+max_seq_len = 2048
+
+use_terminal_contrastive = true
+terminal_sim_measure = "strict"
+
+use_vector_tc = true
+reward_vector_dim = 3
+reward_axes = ["strict", "jaccard", "exit"]
+reward_vector_dump_path = "/tmp/exp19a_rvecs.jsonl"
+dirichlet_alpha = 1.0
+variational_beta = 0.01
+
+# MGDA-VPO: solve the min-norm simplex QP instead of Dirichlet mixing.
+use_mgda_vpo = true
+mgda_grad_method = "loop"
+
+vllm_server_port = 8000
+
+nccl_group_port = 51216

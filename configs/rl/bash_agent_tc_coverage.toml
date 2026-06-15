@@ -1,0 +1,41 @@
+# Idea #1 — COVERAGE reward: train FOR diversity (what best@k/search needs) instead
+# of consensus. Axes = [exit, tool_format, distinct]; distinct = 1 - mean strict
+# similarity to the group, so the policy is rewarded for VALID-but-DIVERSE outputs
+# rather than agreement. Hypothesis: higher best@k than consensus (V2) at equal compute.
+model = "Qwen/Qwen2.5-1.5B-Instruct"
+exclude_task_ids = ["find_py", "find_exec", "sort_uniq"]
+
+[env]
+id = "bash_agent"
+
+[inference]
+gpus = 1
+[inference.args]
+enforce_eager = true
+
+[trainer]
+gpus = 1
+[trainer.args]
+run_name = "bash-agent-tc-coverage"
+report_to = "none"
+max_concurrent = 32
+use_lora = true
+lora_rank = 16
+learning_rate = 1e-5
+micro_batch_size = 8
+rollouts_per_example = 8
+batch_size = 88
+max_steps = 200
+save_steps = 20
+max_tokens = 512
+max_seq_len = 2048
+use_terminal_contrastive = true
+terminal_sim_measure = "strict"
+use_vector_tc = true
+reward_vector_dim = 3
+reward_axes = ["exit", "tool_format", "distinct"]
+reward_vector_dump_path = "/tmp/coverage_rvecs.jsonl"
+dirichlet_alpha = 1.0
+variational_beta = 0.01
+vllm_server_port = 8000
+nccl_group_port = 51216

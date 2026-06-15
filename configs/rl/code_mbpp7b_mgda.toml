@@ -1,0 +1,40 @@
+# MBPP code generation, MULTI-AXIS: reward vector = [tests_pass, format, brevity]
+# from the env rubric, combined via Dirichlet (V2). The genuine multi-axis task:
+# tests_pass = quality anchor; brevity = misalignable axis (rewards short code).
+# Variants: +use_mgda_vpo (MGDA), dirichlet_alpha=1000 (fixed).
+model = "Qwen/Qwen2.5-7B-Instruct"
+[env]
+id = "code_mbpp"
+[inference]
+gpus = 1
+[inference.args]
+enforce_eager = true
+[trainer]
+gpus = 1
+[trainer.args]
+run_name = "code-mbpp7b-vec-mgda"
+report_to = "none"
+max_concurrent = 32
+use_lora = true
+lora_rank = 16
+learning_rate = 1e-5
+micro_batch_size = 4
+rollouts_per_example = 8
+batch_size = 88
+max_steps = 100
+save_steps = 20
+max_tokens = 768
+max_seq_len = 2048
+use_terminal_contrastive = true
+use_vector_tc = true
+reward_source = "rubric"
+reward_vector_dim = 3
+reward_axes = ["tests_pass_reward_func", "format_reward_func", "brevity_reward_func"]
+reward_vector_dump_path = "/tmp/code_mbpp_vec7b_rvecs.jsonl"
+dirichlet_alpha = 1.0
+variational_beta = 0.01
+vllm_server_port = 8000
+nccl_group_port = 51216
+
+use_mgda_vpo = true
+mgda_grad_method = "loop"
